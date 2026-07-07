@@ -1,6 +1,7 @@
 ## 3.3.3
 
 - Add Swift Package Manager (SPM) support for iOS. The plugin now ships with a `Package.swift` manifest alongside the existing CocoaPods podspec, giving consumers the choice of integration method. Compatible with Flutter ≥ 3.22 (enable via `ENV['SWIFT_PACKAGE_MANAGER'] = 'true'` in the project Podfile). No source code changes — the same Swift files are shared between both systems.
+- Fix iOS (and other platforms without USB support) throwing `PrinterConnectionException: USB printing is not supported on this platform` during a combined printer scan ([#14](https://github.com/elrizwiraswara/unified_esc_pos_printer/issues/14)). The stub USB connector threw synchronously from `scan()`, so any `scanPrinters()` / `scanAll()` that included USB (which the default set does) failed on iOS even when the caller only wanted network, BLE, or Bluetooth printers. USB `scan()` on unsupported platforms now yields no devices instead of throwing. `connect()` and `writeBytes()` still throw there, since explicitly using a USB printer on such a platform is a genuine error.
 
 ## 3.3.2
 
