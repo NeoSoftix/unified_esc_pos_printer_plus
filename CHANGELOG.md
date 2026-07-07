@@ -1,3 +1,7 @@
+## 3.3.3
+
+- Fix iOS (and other platforms without USB support) throwing `PrinterConnectionException: USB printing is not supported on this platform` during a combined printer scan ([#14](https://github.com/elrizwiraswara/unified_esc_pos_printer/issues/14)). The stub USB connector threw synchronously from `scan()`, so any `scanPrinters()` / `scanAll()` that included USB (which the default set does) failed on iOS even when the caller only wanted network, BLE, or Bluetooth printers. USB `scan()` on unsupported platforms now yields no devices instead of throwing. `connect()` and `writeBytes()` still throw there, since explicitly using a USB printer on such a platform is a genuine error.
+
 ## 3.3.2
 
 - Allow Bluetooth scan/connect from a background isolate (e.g. a Firebase Messaging background handler or WorkManager) when the required permissions were already granted in a prior foreground session ([#12](https://github.com/elrizwiraswara/unified_esc_pos_printer/issues/12)). The native permission handler previously returned `false` whenever no `Activity` was attached, which is always the case in a background isolate, so every `scan()`/`connect()` threw a permission error even though the OS permissions were granted. It now checks already-granted permissions against the application context (which needs no `Activity`) and only requires an `Activity` to *prompt* for missing ones. Background isolates still cannot show a permission prompt, and Bluetooth discovery remains unreliable there, so connect to a known device by address rather than scanning.
