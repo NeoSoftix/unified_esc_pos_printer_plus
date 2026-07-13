@@ -9,8 +9,8 @@ import 'capability_profile.dart';
 import 'commands.dart';
 import 'enums.dart';
 import 'print_column.dart';
-import 'qrcode.dart';
 import 'print_text_styles.dart';
+import 'qrcode.dart';
 
 /// Low-level ESC/POS byte-command generator.
 ///
@@ -419,84 +419,123 @@ class Generator {
 
   /// Print a table row.
   ///
-  /// Columns are sized proportionally by their [PrintColumn.flex] values — any
-  /// positive integers work, they need not sum to a fixed total. Each column is
-  /// placed with an absolute print position (ESC $) and aligned within its cell
-  /// via that position, so the columns share a single printed line.
+  /// [cols] must sum to exactly 12 in total width.
   /// Set [multiLine] to true (default) to automatically wrap overflowing
   /// column content to a subsequent row.
+  // List<int> row(
+  //   List<PrintColumn> cols, {
+  //   bool multiLine = true,
+  //   int columnGap = 1,
+  // }) {
+  //   const totalChars = 32;
+
+  //   final totalFlex = cols.fold<int>(0, (sum, c) => sum + c.flex);
+
+  //   String line = '';
+
+  //   for (int i = 0; i < cols.length; i++) {
+  //     final col = cols[i];
+
+  //     int width = ((col.flex / totalFlex) * totalChars).floor();
+
+  //     // Last column gets remaining chars
+  //     if (i == cols.length - 1) {
+  //       width = totalChars - line.length;
+  //     }
+
+  //     String text = col.text;
+
+  //     if (text.length > width) {
+  //       text = text.substring(0, width);
+  //     }
+
+  //     switch (col.align) {
+  //       case PrintAlign.right:
+  //         text = text.padLeft(width);
+  //         break;
+
+  //       case PrintAlign.center:
+  //         final left = ((width - text.length) / 2).floor();
+  //         final right = width - text.length - left;
+  //         text = '${' ' * left}$text${' ' * right}';
+  //         break;
+
+  //       case PrintAlign.left:
+  //       default:
+  //         text = text.padRight(width);
+  //     }
+
+  //     line += text;
+  //   }
+
+  //   return text(line);
+  // }
+
   List<int> row(
     List<PrintColumn> cols, {
     bool multiLine = true,
     int columnGap = 1,
   }) {
+    // Use paperSize-specific chars per line
+    final int totalChars = switch (paperSize) {
+      PaperSize.mm58 => 37, // 58mm = 32 chars
+      PaperSize.mm72 => 41, // 72mm = 36 chars
+      PaperSize.mm80 => 45, // 80mm = 39 chars (some printers support 42)
+    };
+
     final int totalFlex = cols.fold(0, (sum, c) => sum + c.flex);
-    final int paperPx = paperSize.widthPixels;
 
     List<int> bytes = [];
-
-    // Establish LEFT justification once, at the beginning of the line — the
-    // only place ESC a is honoured. Per-column alignment is handled entirely
-    // by the absolute print position (ESC $) computed in [_text], so the
-    // justification command must NOT be re-issued per column. Emitting ESC a
-    // mid-line makes many generic ESC/POS printers flush the buffered line and
-    // feed, which pushes every column onto its own line (issue #10).
-    bytes += _setAlign(PrintAlign.left);
-
+    String fullLine = '';
     bool isNextRow = false;
     final List<PrintColumn> nextRow = [];
 
-    int runningFlex = 0;
     for (int i = 0; i < cols.length; i++) {
-      final int fromPx =
-          i == 0 ? 0 : (paperPx * runningFlex / totalFlex).round();
+      final col = cols[i];
+      int width = ((col.flex / totalFlex) * totalChars).floor();
 
-      runningFlex += cols[i].flex;
-
-      final bool isLastCol = i == cols.length - 1;
-      final int toPx = (paperPx * runningFlex / totalFlex).round() -
-          (isLastCol ? 0 : columnGap);
-
-      final double charWidth = _getCharWidth(cols[i].style);
-      final int maxCharsNb = ((toPx - fromPx) / charWidth).floor();
-
-      Uint8List encoded = cols[i].textEncoded != null
-          ? cols[i].textEncoded!
-          : _encode(cols[i].text);
-
-      if (multiLine && encoded.length > maxCharsNb) {
-        nextRow.add(
-          PrintColumn(
-            textEncoded: encoded.sublist(maxCharsNb),
-            flex: cols[i].flex,
-            align: cols[i].align,
-            style: cols[i].style,
-          ),
-        );
-
-        encoded = encoded.sublist(0, maxCharsNb);
-        isNextRow = true;
-      } else {
-        nextRow.add(
-          PrintColumn(
-            text: '',
-            flex: cols[i].flex,
-            align: cols[i].align,
-            style: cols[i].style,
-          ),
-        );
+      // Last column gets remaining chars
+      if (i == cols.length - 1) {
+        width = totalChars - fullLine.length;
       }
 
-      bytes += _text(
-        encoded,
-        style: cols[i].style,
-        align: cols[i].align,
-        fromPx: fromPx,
-        toPx: toPx,
-      );
+      Uint8List encoded =
+          col.textEncoded != null ? col.textEncoded! : _encode(col.text);
+
+      if (multiLine && encoded.length > width) {
+        nextRow.add(PrintColumn(
+          textEncoded: encoded.sublist(width),
+          flex: col.flex,
+          align: col.align,
+          style: col.style,
+        ));
+        encoded = encoded.sublist(0, width);
+        isNextRow = true;
+      }
+
+      String textStr = codec.decode(encoded);
+      int padding = width - textStr.length;
+
+      if (padding > 0) {
+        if (col.align == PrintAlign.left) {
+          textStr = textStr.padRight(width);
+        } else if (col.align == PrintAlign.right) {
+          textStr = textStr.padLeft(width);
+        } else if (col.align == PrintAlign.center) {
+          int leftPad = (padding / 2).floor();
+          textStr = '${' ' * leftPad}$textStr${' ' * (padding - leftPad)}';
+        }
+      }
+
+      fullLine += textStr;
+      if (i < cols.length - 1) fullLine += ' '; // columnGap
     }
 
+    // Print entire line as ONE text with left alignment
+    bytes += text(fullLine, align: PrintAlign.left);
+    bytes = bytes.sublist(0, bytes.length - 1); // Remove extra newline
     bytes += emptyLines(1);
+
     if (isNextRow) bytes += row(nextRow, columnGap: columnGap);
 
     return bytes;
@@ -732,12 +771,7 @@ class Generator {
       );
     }
 
-    // For positioned text (table columns), horizontal alignment is realised by
-    // the ESC $ absolute position set above — `align` only shifts that position.
-    // Re-issuing ESC a here would be redundant and, mid-line, makes many
-    // generic ESC/POS printers flush the line, breaking rows onto separate
-    // lines (issue #10). So only emit ESC a for full-line text (fromPx == null).
-    bytes += setStyles(style, align: fromPx == null ? align : null);
+    bytes += setStyles(style, align: align);
     bytes += textBytes;
     return bytes;
   }
