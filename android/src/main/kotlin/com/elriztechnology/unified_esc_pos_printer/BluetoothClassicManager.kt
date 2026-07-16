@@ -331,7 +331,7 @@ class BluetoothClassicManager(private val context: Context) {
         inputThread = thread
     }
 
-    fun write(data: ByteArray, result: MethodChannel.Result) {
+    fun write(data: ByteArray, chunkSize: Int, chunkDelayMs: Int, result: MethodChannel.Result) {
         ops.execute {
             val os = outputStream
             if (os == null) {
@@ -342,8 +342,24 @@ class BluetoothClassicManager(private val context: Context) {
             }
 
             try {
-                os.write(data)
-                os.flush()
+                // Pace the transfer: cheap printer modules forward data to
+                // the print MCU over an internal UART without flow control,
+                // and a large job at full RFCOMM speed overflows it.
+                val step = if (chunkSize > 0) chunkSize else data.size.coerceAtLeast(1)
+                var offset = 0
+                while (offset < data.size) {
+                    val len = minOf(step, data.size - offset)
+                    os.write(data, offset, len)
+                    os.flush()
+                    offset += len
+                    if (chunkDelayMs > 0 && offset < data.size) {
+                        try {
+                            Thread.sleep(chunkDelayMs.toLong())
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                        }
+                    }
+                }
                 mainHandler.post { result.success(null) }
             } catch (e: IOException) {
                 mainHandler.post {

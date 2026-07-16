@@ -139,7 +139,9 @@ class UnifiedEscPosPrinterPlugin : FlutterPlugin, MethodCallHandler, ActivityAwa
             }
             "btWrite" -> {
                 val data = call.argument<ByteArray>("data")!!
-                bluetoothClassicManager.write(data, result)
+                val chunkSize = call.argument<Int>("chunkSize") ?: 512
+                val chunkDelayMs = call.argument<Int>("chunkDelayMs") ?: 0
+                bluetoothClassicManager.write(data, chunkSize, chunkDelayMs, result)
             }
             "btDisconnect" -> bluetoothClassicManager.disconnect(result)
 

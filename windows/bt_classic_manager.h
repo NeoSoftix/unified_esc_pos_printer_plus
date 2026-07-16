@@ -52,7 +52,7 @@ class BtClassicManager {
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
 
   void Write(
-      const std::vector<uint8_t>& data,
+      const std::vector<uint8_t>& data, int chunk_size, int chunk_delay_ms,
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
 
   void Disconnect(

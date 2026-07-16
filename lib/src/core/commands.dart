@@ -138,6 +138,12 @@ const int kScanSubnetTimeoutMs = 500;
 /// Default chunk size for Bluetooth Classic writes (bytes)
 const int kDefaultBtChunkSize = 512;
 
+/// Default pause between Bluetooth Classic write chunks (milliseconds).
+/// Paces the transfer so cheap printer modules, which forward data to the
+/// print MCU over an internal UART without flow control, are not overflowed
+/// by large jobs.
+const int kDefaultBtChunkDelayMs = 5;
+
 /// Conservative Bluetooth Classic (SPP) throughput for drain estimation (bytes/second)
 const int kBtDrainBytesPerSecond = 8 * 1024;
 

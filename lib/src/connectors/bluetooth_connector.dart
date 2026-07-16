@@ -30,15 +30,21 @@ import 'printer_connector.dart';
 class BluetoothConnector extends PrinterConnector<BluetoothPrinterDevice> {
   BluetoothConnector({
     this.chunkSize = kDefaultBtChunkSize,
+    this.interChunkDelay = const Duration(milliseconds: kDefaultBtChunkDelayMs),
     this.drainBytesPerSecond = kBtDrainBytesPerSecond,
     this.maxDrainWait = const Duration(milliseconds: kMaxDrainWaitMs),
   });
 
-  /// Retained for backward compatibility; no longer used. Print jobs are
-  /// handed to the platform in a single write call so concurrent jobs
-  /// cannot interleave (issue #21).
-  @Deprecated('No longer used; writes are sent as a single job')
+  /// Bytes per chunk within a write job. The job is still delivered to the
+  /// platform in a single call (atomic against jobs from other isolates,
+  /// issue #21); the native side splits it into chunks to pace the transfer.
   final int chunkSize;
+
+  /// Pause between chunks. Cheap SPP printer modules forward data to the
+  /// print MCU over an internal UART without flow control; pushing a large
+  /// job at full RFCOMM speed overflows it and corrupts the output. Set to
+  /// [Duration.zero] for printers that handle full-speed transfers.
+  final Duration interChunkDelay;
 
   /// Link throughput estimate used to compute drain time.
   final int drainBytesPerSecond;
@@ -256,8 +262,13 @@ class BluetoothConnector extends PrinterConnector<BluetoothPrinterDevice> {
     try {
       // The full job is handed to the platform in a single call so that
       // concurrent jobs from other isolates cannot interleave with it
-      // (issue #21); the native side serializes whole write calls.
-      await _platform.btWrite(data: Uint8List.fromList(bytes));
+      // (issue #21); the native side serializes whole write calls and
+      // paces the transfer chunk by chunk.
+      await _platform.btWrite(
+        data: Uint8List.fromList(bytes),
+        chunkSize: chunkSize,
+        chunkDelayMs: interChunkDelay.inMilliseconds,
+      );
 
       _drain.onWrite(bytes.length, writeStart, DateTime.now());
       _setState(PrinterConnectionState.connected);

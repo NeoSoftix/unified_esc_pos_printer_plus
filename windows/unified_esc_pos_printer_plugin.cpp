@@ -226,7 +226,8 @@ void UnifiedEscPosPrinterPlugin::HandleMethodCall(
         }
       }
     }
-    bt_manager_->Write(data, std::move(result));
+    bt_manager_->Write(data, get_int("chunkSize", 512),
+                       get_int("chunkDelayMs", 0), std::move(result));
   } else if (method == "btDisconnect") {
     bt_manager_->Disconnect(std::move(result));
   }

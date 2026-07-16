@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/services.dart';
 
+import '../core/commands.dart';
+
 /// Low-level platform channel wrapper for native Bluetooth operations.
 ///
 /// Singleton — both [BleConnector] and [BluetoothConnector] share this
@@ -154,8 +156,20 @@ class BluetoothPlatformChannel {
   }
 
   /// Write data to the connected Classic Bluetooth device.
-  Future<void> btWrite({required Uint8List data}) async {
-    await _method.invokeMethod('btWrite', {'data': data});
+  ///
+  /// The whole job is sent in one call; the native side splits it into
+  /// [chunkSize]-byte chunks, pausing [chunkDelayMs] between them so slow
+  /// printer modules are not overflowed.
+  Future<void> btWrite({
+    required Uint8List data,
+    int chunkSize = kDefaultBtChunkSize,
+    int chunkDelayMs = 0,
+  }) async {
+    await _method.invokeMethod('btWrite', {
+      'data': data,
+      'chunkSize': chunkSize,
+      'chunkDelayMs': chunkDelayMs,
+    });
   }
 
   /// Disconnect the current Classic Bluetooth connection.
