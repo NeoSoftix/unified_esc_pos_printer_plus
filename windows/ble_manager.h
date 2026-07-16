@@ -76,6 +76,7 @@ class BleManager {
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
 
   void Write(const std::vector<uint8_t>& data, bool without_response,
+             int max_chunk_size, int chunk_delay_ms, int bytes_per_second,
              std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
 
   void Disconnect(std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);

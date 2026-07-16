@@ -10,30 +10,39 @@ import 'printer_connector.dart';
 
 /// Connector for BLE (Bluetooth Low Energy) ESC/POS printers.
 ///
-/// **Discovery:** Uses native BLE scanning to find nearby BLE devices.
+/// **Discovery:** Native BLE scan.
 ///
-/// **Connection:** Discovers services, then auto-locates a writable
-/// characteristic. Tries the well-known ESC/POS BLE service UUID first;
-/// falls back to any writable characteristic found.
+/// **Connection:** Finds a writable characteristic (ESC/POS UUID first, then
+/// any writable). Sends `ESC @` on connect. Throws
+/// [PrinterPermissionException] if Bluetooth permission is denied.
 ///
-/// **Writing:** Negotiates MTU 512 after connecting and chunks data into
-/// MTU-sized write operations. Write-without-response data is drained
-/// before [disconnect] closes the link.
-///
-/// **Permissions:** Automatically requests Bluetooth permissions when
-/// scanning or connecting. Throws [PrinterPermissionException] if denied.
+/// **Writing:** Paces [chunkSize] slices at ~[bytesPerSecond] to avoid
+/// overflowing slow printer modules. Drains write-without-response data
+/// before [disconnect].
 class BleConnector extends PrinterConnector<BlePrinterDevice> {
   BleConnector({
+    this.chunkSize = kDefaultBleChunkSize,
+    this.bytesPerSecond = kDefaultBleBytesPerSecond,
+    this.interChunkDelay =
+        const Duration(milliseconds: kDefaultBleChunkDelayMs),
     this.writeWithoutResponseDrainDelay =
         const Duration(milliseconds: kBleWwrDrainDelayMs),
   });
 
-  /// Drain delay applied after write-without-response data.
+  /// Bytes per GATT write. `0` uses the negotiated MTU.
+  final int chunkSize;
+
+  /// Target write throughput (bytes/second). `0` disables throughput pacing.
+  final int bytesPerSecond;
+
+  /// Minimum pause between chunks (combined with [bytesPerSecond] pacing).
+  final Duration interChunkDelay;
+
+  /// Drain delay after write-without-response data.
   final Duration writeWithoutResponseDrainDelay;
 
   final BluetoothPlatformChannel _platform = BluetoothPlatformChannel.instance;
 
-  int _mtuPayload = 20;
   bool _writeWithoutResponse = false;
   bool _pendingWwrDrain = false;
   StreamSubscription<Map<String, dynamic>>? _connectionSub;
@@ -179,21 +188,12 @@ class BleConnector extends PrinterConnector<BlePrinterDevice> {
       );
     }
 
-    // Get negotiated MTU
-    try {
-      _mtuPayload = await _platform.bleGetMtu();
-    } catch (_) {
-      _mtuPayload = 20; // safe minimum
-    }
-
-    // Check write-without-response support
     try {
       _writeWithoutResponse = await _platform.bleSupportsWriteWithoutResponse();
     } catch (_) {
       _writeWithoutResponse = false;
     }
 
-    // Monitor for remote disconnection
     _connectionSub = _platform.connectionStateStream
         .where((event) => event['type'] == 'ble')
         .listen((event) {
@@ -205,6 +205,16 @@ class BleConnector extends PrinterConnector<BlePrinterDevice> {
     });
 
     _setState(PrinterConnectionState.connected);
+
+    try {
+      await writeBytes(cInit.codeUnits);
+    } catch (e) {
+      await disconnect();
+      throw PrinterConnectionException(
+        'BLE init (ESC @) to ${device.name} failed',
+        cause: e,
+      );
+    }
   }
 
   @override
@@ -214,12 +224,36 @@ class BleConnector extends PrinterConnector<BlePrinterDevice> {
     _setState(PrinterConnectionState.printing);
 
     try {
-      for (int i = 0; i < bytes.length; i += _mtuPayload) {
-        final int end = (i + _mtuPayload).clamp(0, bytes.length);
+      final Uint8List data =
+          bytes is Uint8List ? bytes : Uint8List.fromList(bytes);
+      final int step = chunkSize > 0 ? chunkSize : 128;
+      var offset = 0;
+
+      while (offset < data.length) {
+        final int end =
+            offset + step < data.length ? offset + step : data.length;
+        final Uint8List slice = Uint8List.sublistView(data, offset, end);
+
         await _platform.bleWrite(
-          data: Uint8List.fromList(bytes.sublist(i, end)),
+          data: slice,
           withoutResponse: _writeWithoutResponse,
+          chunkSize: step,
+          chunkDelayMs: 0,
+          bytesPerSecond: 0,
         );
+
+        offset = end;
+        if (offset >= data.length) break;
+
+        final int throughputMs = bytesPerSecond > 0
+            ? (slice.length * 1000 + bytesPerSecond - 1) ~/ bytesPerSecond
+            : 0;
+        final int waitMs = throughputMs > interChunkDelay.inMilliseconds
+            ? throughputMs
+            : interChunkDelay.inMilliseconds;
+        if (waitMs > 0) {
+          await Future<void>.delayed(Duration(milliseconds: waitMs));
+        }
       }
 
       if (_writeWithoutResponse) _pendingWwrDrain = true;
