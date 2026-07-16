@@ -181,7 +181,7 @@ ticket.text('Café coûté 12,50 €', style: const PrintTextStyle(codeTable: 'C
 
 ### Table Layouts
 
-Use `row()` with `PrintColumn` for multi-column layouts. Columns use flex-based proportional sizing:
+Use `row()` with `PrintColumn` for multi-column layouts. Columns use flex-based proportional sizing and support per-column `PrintTextStyle`:
 
 ```dart
 // 2-column receipt layout
@@ -191,6 +191,7 @@ ticket.row([
     text: '\$3.50',
     flex: 1,
     align: PrintAlign.right,
+    style: const PrintTextStyle(bold: true),
   ),
 ]);
 

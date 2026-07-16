@@ -12,8 +12,8 @@ import 'enums.dart';
 import 'generator.dart';
 import 'print_column.dart';
 import 'print_raster_column.dart';
-import 'qrcode.dart';
 import 'print_text_styles.dart';
+import 'qrcode.dart';
 
 /// High-level ESC/POS ticket builder.
 ///
@@ -200,6 +200,9 @@ class Ticket {
   }
 
   /// Print a table row.
+  ///
+  /// Per-column [PrintColumn.style] is emitted; bold is reinforced with a CR
+  /// overstrike so mid-line emphasis still shows on clone printers (#23).
   void row(
     List<PrintColumn> cols, {
     bool multiLine = true,

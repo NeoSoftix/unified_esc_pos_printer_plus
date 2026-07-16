@@ -26,6 +26,11 @@ import 'print_text_styles.dart';
 ///
 /// Provide either [text] (plain string) or [textEncoded] (pre-encoded bytes),
 /// not both.
+///
+/// [style] is applied per column (bold, underline, size, etc.). Bold in a
+/// row is reinforced with a CR overstrike because many printers ignore
+/// mid-line `ESC E`. For Flutter `TextStyle` / multi-script columns, use
+/// `rowRaster` instead.
 class PrintColumn {
   PrintColumn({
     this.text = '',
