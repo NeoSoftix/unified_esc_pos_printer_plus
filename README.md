@@ -450,7 +450,26 @@ final manager = PrinterManager(
 );
 ```
 
-### Error Handling
+### Concurrent Print Jobs
+
+Print jobs cannot interrupt each other:
+
+- **Within one isolate**, `PrinterManager` serializes its operations. A
+  `connect()` or `disconnect()` issued while another job is printing waits
+  for that job to finish, and `connect()` to the already-connected device is
+  a no-op. Calling `printTicket()` from multiple places without external
+  locking is safe; the jobs print one after the other.
+- **Across isolates on Android** (e.g. printing from a background
+  notification handler while the main app prints too), the Bluetooth
+  Classic, BLE, and USB printer-class connections are shared process-wide.
+  A second isolate connecting to the same printer reuses the live connection
+  and its job queues behind the one in progress. Connecting to a *different*
+  printer while another isolate holds the connection throws a
+  `PrinterConnectionException` with a printer-busy message; retry after the
+  other job finishes.
+
+Each print job is delivered to the platform as a single atomic write, so
+even jobs from separate isolates cannot interleave their bytes.
 
 The package provides a typed exception hierarchy:
 

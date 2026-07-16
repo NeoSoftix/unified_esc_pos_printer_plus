@@ -16,9 +16,10 @@ import 'printer_connector.dart';
 /// characteristic. Tries the well-known ESC/POS BLE service UUID first;
 /// falls back to any writable characteristic found.
 ///
-/// **Writing:** Negotiates MTU 512 after connecting and chunks data into
-/// MTU-sized write operations. Write-without-response data is drained
-/// before [disconnect] closes the link.
+/// **Writing:** Each write is handed to the platform as a single job; the
+/// native side negotiates the MTU and chunks the data, and whole jobs are
+/// serialized so concurrent prints cannot interleave. Write-without-response
+/// data is drained before [disconnect] closes the link.
 ///
 /// **Permissions:** Automatically requests Bluetooth permissions when
 /// scanning or connecting. Throws [PrinterPermissionException] if denied.
@@ -33,7 +34,6 @@ class BleConnector extends PrinterConnector<BlePrinterDevice> {
 
   final BluetoothPlatformChannel _platform = BluetoothPlatformChannel.instance;
 
-  int _mtuPayload = 20;
   bool _writeWithoutResponse = false;
   bool _pendingWwrDrain = false;
   StreamSubscription<Map<String, dynamic>>? _connectionSub;
@@ -179,13 +179,6 @@ class BleConnector extends PrinterConnector<BlePrinterDevice> {
       );
     }
 
-    // Get negotiated MTU
-    try {
-      _mtuPayload = await _platform.bleGetMtu();
-    } catch (_) {
-      _mtuPayload = 20; // safe minimum
-    }
-
     // Check write-without-response support
     try {
       _writeWithoutResponse = await _platform.bleSupportsWriteWithoutResponse();
@@ -214,13 +207,14 @@ class BleConnector extends PrinterConnector<BlePrinterDevice> {
     _setState(PrinterConnectionState.printing);
 
     try {
-      for (int i = 0; i < bytes.length; i += _mtuPayload) {
-        final int end = (i + _mtuPayload).clamp(0, bytes.length);
-        await _platform.bleWrite(
-          data: Uint8List.fromList(bytes.sublist(i, end)),
-          withoutResponse: _writeWithoutResponse,
-        );
-      }
+      // The full job is handed to the platform in a single call; the native
+      // side chunks it by the negotiated MTU and serializes whole jobs so
+      // concurrent prints (including from other isolates) cannot interleave
+      // (issue #21).
+      await _platform.bleWrite(
+        data: Uint8List.fromList(bytes),
+        withoutResponse: _writeWithoutResponse,
+      );
 
       if (_writeWithoutResponse) _pendingWwrDrain = true;
       _setState(PrinterConnectionState.connected);

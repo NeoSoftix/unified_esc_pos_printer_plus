@@ -17,12 +17,28 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     private var mtuPayload: Int = 20
     private var canWriteWithoutResponse: Bool = false
     private var connectResult: FlutterResult?
-    private var writeResult: FlutterResult?
-    private var pendingWriteData: Data?
-    private var pendingWriteResult: FlutterResult?
     private var connectTimer: Timer?
     private var targetServiceUUID: CBUUID?
     private var targetCharUUID: CBUUID?
+
+    // One write call = one print job. Jobs are chunked by the MTU and run
+    // one at a time so concurrent jobs cannot interleave (issue #21).
+    private class WriteJob {
+        let chunks: [Data]
+        let withoutResponse: Bool
+        let result: FlutterResult
+        var index = 0
+        var awaitingAck = false
+
+        init(chunks: [Data], withoutResponse: Bool, result: @escaping FlutterResult) {
+            self.chunks = chunks
+            self.withoutResponse = withoutResponse
+            self.result = result
+        }
+    }
+
+    private var writeJobs: [WriteJob] = []
+    private var activeJob: WriteJob?
 
     var connectionStateCallback: ((String) -> Void)?
 
@@ -166,27 +182,79 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     func write(data: Data, withoutResponse: Bool, result: @escaping FlutterResult) {
-        guard let peripheral = connectedPeripheral, let char = txCharacteristic else {
+        guard connectedPeripheral != nil, txCharacteristic != nil else {
             result(FlutterError(code: "NOT_CONNECTED", message: "BLE device not connected", details: nil))
             return
         }
 
-        if withoutResponse {
-            // CoreBluetooth has a finite internal queue for write-without-response packets.
-            // If we write when the queue is full, the packet is silently dropped.
-            // Check canSendWriteWithoutResponse first; if not ready, park the write and
-            // resolve it from peripheralIsReady(toSendWriteWithoutResponse:).
-            if peripheral.canSendWriteWithoutResponse {
-                peripheral.writeValue(data, for: char, type: .withoutResponse)
-                result(nil)
-            } else {
-                pendingWriteData = data
-                pendingWriteResult = result
-            }
-        } else {
-            writeResult = result
-            peripheral.writeValue(data, for: char, type: .withResponse)
+        // The Dart side hands the whole print job to this single call; chunk
+        // it by the MTU and send sequentially via the job queue.
+        let chunkSize = max(20, mtuPayload)
+        var chunks: [Data] = []
+        var offset = 0
+        while offset < data.count {
+            let end = min(offset + chunkSize, data.count)
+            chunks.append(data.subdata(in: offset..<end))
+            offset = end
         }
+
+        if chunks.isEmpty {
+            result(nil)
+            return
+        }
+
+        writeJobs.append(WriteJob(chunks: chunks, withoutResponse: withoutResponse, result: result))
+        pumpWriteJobs()
+    }
+
+    private func pumpWriteJobs() {
+        guard activeJob == nil, !writeJobs.isEmpty else { return }
+        activeJob = writeJobs.removeFirst()
+        sendChunks()
+    }
+
+    // Send chunks of the active job until it completes, backpressure kicks
+    // in (write-without-response), or an ACK is pending (write-with-response).
+    private func sendChunks() {
+        guard let job = activeJob, !job.awaitingAck else { return }
+        guard let peripheral = connectedPeripheral, let char = txCharacteristic else {
+            activeJob = nil
+            job.result(FlutterError(code: "NOT_CONNECTED", message: "BLE device not connected", details: nil))
+            pumpWriteJobs()
+            return
+        }
+
+        while job.index < job.chunks.count {
+            let chunk = job.chunks[job.index]
+            if job.withoutResponse {
+                // CoreBluetooth silently drops write-without-response packets
+                // when its internal queue is full; resume from
+                // peripheralIsReady(toSendWriteWithoutResponse:).
+                if !peripheral.canSendWriteWithoutResponse { return }
+                peripheral.writeValue(chunk, for: char, type: .withoutResponse)
+                job.index += 1
+            } else {
+                job.awaitingAck = true
+                peripheral.writeValue(chunk, for: char, type: .withResponse)
+                job.index += 1
+                return // resume from didWriteValueFor
+            }
+        }
+
+        activeJob = nil
+        job.result(nil)
+        pumpWriteJobs()
+    }
+
+    private func failAllJobs(code: String, message: String) {
+        if let job = activeJob {
+            activeJob = nil
+            job.result(FlutterError(code: code, message: message, details: nil))
+        }
+        for job in writeJobs {
+            job.result(FlutterError(code: code, message: message, details: nil))
+        }
+        writeJobs.removeAll()
     }
 
     func disconnect(result: @escaping FlutterResult) {
@@ -205,8 +273,7 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         txCharacteristic = nil
         mtuPayload = 20
         canWriteWithoutResponse = false
-        pendingWriteData = nil
-        pendingWriteResult = nil
+        failAllJobs(code: "DISCONNECTED", message: "BLE device disconnected")
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
@@ -323,21 +390,21 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard let job = activeJob else { return }
+        job.awaitingAck = false
+
         if let error = error {
-            writeResult?(FlutterError(code: "WRITE_FAILED", message: error.localizedDescription, details: nil))
-        } else {
-            writeResult?(nil)
+            activeJob = nil
+            job.result(FlutterError(code: "WRITE_FAILED", message: error.localizedDescription, details: nil))
+            pumpWriteJobs()
+            return
         }
-        writeResult = nil
+
+        sendChunks()
     }
 
     func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
-        guard let data = pendingWriteData, let char = txCharacteristic else { return }
-        let result = pendingWriteResult
-        pendingWriteData = nil
-        pendingWriteResult = nil
-        peripheral.writeValue(data, for: char, type: .withoutResponse)
-        result?(nil)
+        sendChunks()
     }
 
     private func isWritable(_ c: CBCharacteristic) -> Bool {

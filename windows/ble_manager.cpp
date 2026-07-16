@@ -465,27 +465,37 @@ void BleManager::Write(
       result.release());
   auto char_copy = tx_characteristic_;
 
-  std::thread([this, data, without_response, shared_result, char_copy]() {
-    try {
-      DataWriter writer;
-      writer.WriteBytes(
-          winrt::array_view<const uint8_t>(data.data(), static_cast<uint32_t>(data.size())));
-      auto buffer = writer.DetachBuffer();
+  const size_t chunk_size = mtu_payload_ >= 20 ? static_cast<size_t>(mtu_payload_) : 20;
 
+  std::thread([this, data, without_response, shared_result, char_copy, chunk_size]() {
+    try {
       auto write_option = without_response
           ? GattWriteOption::WriteWithoutResponse
           : GattWriteOption::WriteWithResponse;
 
-      auto status = char_copy.WriteValueAsync(buffer, write_option).get();
-      if (status == GattCommunicationStatus::Success) {
-        dispatcher_->Post([shared_result]() {
-          shared_result->Success(flutter::EncodableValue());
-        });
-      } else {
-        dispatcher_->Post([shared_result]() {
-          shared_result->Error("WRITE_FAILED", "GATT write failed");
-        });
+      // The Dart side hands the whole print job to this single call; chunk it
+      // by the negotiated MTU and send sequentially so concurrent jobs cannot
+      // interleave (issue #21).
+      for (size_t offset = 0; offset < data.size(); offset += chunk_size) {
+        const size_t len = (std::min)(chunk_size, data.size() - offset);
+
+        DataWriter writer;
+        writer.WriteBytes(winrt::array_view<const uint8_t>(
+            data.data() + offset, static_cast<uint32_t>(len)));
+        auto buffer = writer.DetachBuffer();
+
+        auto status = char_copy.WriteValueAsync(buffer, write_option).get();
+        if (status != GattCommunicationStatus::Success) {
+          dispatcher_->Post([shared_result]() {
+            shared_result->Error("WRITE_FAILED", "GATT write failed");
+          });
+          return;
+        }
       }
+
+      dispatcher_->Post([shared_result]() {
+        shared_result->Success(flutter::EncodableValue());
+      });
     } catch (const winrt::hresult_error& e) {
       auto msg = winrt::to_string(e.message());
       dispatcher_->Post([shared_result, msg]() {

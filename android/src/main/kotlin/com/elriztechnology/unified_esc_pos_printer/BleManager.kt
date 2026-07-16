@@ -10,7 +10,9 @@ import android.os.Handler
 import android.os.Looper
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
+import java.util.ArrayDeque
 import java.util.UUID
+import java.util.concurrent.CopyOnWriteArrayList
 
 class BleManager(private val context: Context) {
 
@@ -19,6 +21,84 @@ class BleManager(private val context: Context) {
             UUID.fromString("000018f0-0000-1000-8000-00805f9b34fb")
         private val ESC_POS_TX_CHAR_UUID =
             UUID.fromString("00002af1-0000-1000-8000-00805f9b34fb")
+
+        // The GATT link is shared process-wide. Background isolates (e.g.
+        // notification handlers) attach their own plugin instance, so the
+        // connection must not be owned by a single engine (issue #21).
+        //
+        // All state below is confined to the main thread: method calls from
+        // every engine arrive on it, and GATT callbacks post onto it.
+        private val sharedMainHandler = Handler(Looper.getMainLooper())
+
+        private var gatt: BluetoothGatt? = null
+        private var connectedDeviceId: String? = null
+        private var txCharacteristic: BluetoothGattCharacteristic? = null
+        private var negotiatedMtu: Int = 20
+        private var writeWithoutResponse: Boolean = false
+
+        // In-progress connection attempt; concurrent connects to the same
+        // device join it instead of starting a second attempt.
+        private var connectingDeviceId: String? = null
+        private val pendingConnects =
+            mutableListOf<Pair<BleManager, MethodChannel.Result>>()
+
+        // Instances (one per Flutter engine) currently holding the
+        // connection. The GATT closes only when the last lease is released.
+        private val leaseHolders = mutableSetOf<BleManager>()
+
+        private val instances = CopyOnWriteArrayList<BleManager>()
+
+        // One write call = one print job. Jobs are chunked by the negotiated
+        // MTU and run one at a time so concurrent jobs cannot interleave.
+        private class WriteJob(
+            val chunks: List<ByteArray>,
+            val withoutResponse: Boolean,
+            val result: MethodChannel.Result
+        ) {
+            var index = 0
+        }
+
+        private val jobQueue = ArrayDeque<WriteJob>()
+        private var activeJob: WriteJob? = null
+
+        private fun broadcastState(state: String) {
+            for (instance in instances) {
+                instance.connectionStateCallback?.invoke(state)
+            }
+        }
+
+        private fun failPendingConnects(code: String, message: String) {
+            for ((_, res) in pendingConnects) {
+                res.error(code, message, null)
+            }
+            pendingConnects.clear()
+            connectingDeviceId = null
+        }
+
+        private fun failAllJobs(code: String, message: String) {
+            activeJob?.result?.error(code, message, null)
+            activeJob = null
+            while (jobQueue.isNotEmpty()) {
+                jobQueue.poll().result.error(code, message, null)
+            }
+        }
+
+        // Tear down the shared connection. Main thread only.
+        private fun cleanupConnection() {
+            failAllJobs("DISCONNECTED", "BLE device disconnected")
+            try {
+                gatt?.disconnect()
+                gatt?.close()
+            } catch (_: SecurityException) {
+                // Ignore — we're disconnecting anyway
+            }
+            gatt = null
+            connectedDeviceId = null
+            txCharacteristic = null
+            negotiatedMtu = 20
+            writeWithoutResponse = false
+            leaseHolders.clear()
+        }
     }
 
     private val bluetoothAdapter: BluetoothAdapter? =
@@ -28,23 +108,17 @@ class BleManager(private val context: Context) {
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // Scan state
+    // Scan state (per engine instance)
     private var scanEventSink: EventChannel.EventSink? = null
     private val discoveredDevices = mutableListOf<Map<String, String>>()
     private var scanCallback: ScanCallback? = null
     private var scanTimeoutRunnable: Runnable? = null
 
-    // Connection state
-    private var gatt: BluetoothGatt? = null
-    private var txCharacteristic: BluetoothGattCharacteristic? = null
-    private var negotiatedMtu: Int = 20 // safe default (will be updated after MTU negotiation)
-    private var writeWithoutResponse: Boolean = false
-    private var connectResult: MethodChannel.Result? = null
-    private var writeResult: MethodChannel.Result? = null
-    private var targetServiceUuid: UUID? = null
-    private var targetCharUuid: UUID? = null
-
     var connectionStateCallback: ((String) -> Unit)? = null
+
+    init {
+        instances.add(this)
+    }
 
     val scanStreamHandler = object : EventChannel.StreamHandler {
         override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
@@ -98,7 +172,7 @@ class BleManager(private val context: Context) {
                 val id = device.address
                 if (discoveredDevices.none { it["deviceId"] == id }) {
                     val name = try { device.name } catch (_: SecurityException) { null }
-                    
+
                     discoveredDevices.add(
                         mapOf(
                             "deviceId" to id,
@@ -167,8 +241,45 @@ class BleManager(private val context: Context) {
             return
         }
 
-        targetServiceUuid = serviceUuid?.let { UUID.fromString(it) } ?: ESC_POS_SERVICE_UUID
-        targetCharUuid = characteristicUuid?.let { UUID.fromString(it) } ?: ESC_POS_TX_CHAR_UUID
+        // Reuse the live connection when another isolate (or this one)
+        // already connected to the same printer.
+        if (connectedDeviceId == deviceId && gatt != null) {
+            leaseHolders.add(this)
+            connectionStateCallback?.invoke("connected")
+            result.success(null)
+            return
+        }
+
+        // Join an in-progress attempt to the same device.
+        if (connectingDeviceId != null) {
+            if (connectingDeviceId == deviceId) {
+                pendingConnects.add(this to result)
+            } else {
+                result.error(
+                    "PRINTER_BUSY",
+                    "Another BLE connection attempt is in progress",
+                    null
+                )
+            }
+            return
+        }
+
+        // Connected to a different printer: only tear it down when no other
+        // isolate still holds it.
+        if (gatt != null) {
+            if (leaseHolders.any { it !== this }) {
+                result.error(
+                    "PRINTER_BUSY",
+                    "Another print job is using the BLE connection",
+                    null
+                )
+                return
+            }
+            cleanupConnection()
+        }
+
+        val targetService = serviceUuid?.let { UUID.fromString(it) } ?: ESC_POS_SERVICE_UUID
+        val targetChar = characteristicUuid?.let { UUID.fromString(it) } ?: ESC_POS_TX_CHAR_UUID
 
         val device: BluetoothDevice
         try {
@@ -178,79 +289,76 @@ class BleManager(private val context: Context) {
             return
         }
 
-        connectResult = result
+        connectingDeviceId = deviceId
+        pendingConnects.add(this to result)
 
-        // Timeout handler
+        var attemptGatt: BluetoothGatt? = null
+
         val timeoutRunnable = Runnable {
-            if (connectResult != null) {
-                connectResult?.error("TIMEOUT", "BLE connection timed out", null)
-                connectResult = null
-                
-                try { gatt?.disconnect(); gatt?.close() } catch (_: SecurityException) {
+            if (connectingDeviceId == deviceId) {
+                failPendingConnects("TIMEOUT", "BLE connection timed out")
+                try {
+                    attemptGatt?.disconnect()
+                    attemptGatt?.close()
+                } catch (_: SecurityException) {
                     // Ignore — we're disconnecting anyway
                 }
-
-                gatt = null
             }
         }
-        mainHandler.postDelayed(timeoutRunnable, timeoutMs)
+        sharedMainHandler.postDelayed(timeoutRunnable, timeoutMs)
 
         val gattCallback = object : BluetoothGattCallback() {
             override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    gatt = g
                     try {
                         g.requestMtu(512)
                     } catch (e: SecurityException) {
-                        mainHandler.post {
-                            mainHandler.removeCallbacks(timeoutRunnable)
-                            connectResult?.error("PERMISSION_DENIED", "MTU request denied", e.message)
-                            connectResult = null
+                        sharedMainHandler.post {
+                            sharedMainHandler.removeCallbacks(timeoutRunnable)
+                            failPendingConnects("PERMISSION_DENIED", "MTU request denied")
                         }
                     }
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    mainHandler.post {
-                        mainHandler.removeCallbacks(timeoutRunnable)
+                    sharedMainHandler.post {
+                        sharedMainHandler.removeCallbacks(timeoutRunnable)
 
-                        if (connectResult != null) {
-                            connectResult?.error("DISCONNECTED", "BLE device disconnected during setup", null)
-                            connectResult = null
+                        if (connectingDeviceId == deviceId && pendingConnects.isNotEmpty()) {
+                            failPendingConnects("DISCONNECTED", "BLE device disconnected during setup")
+                            try { g.close() } catch (_: SecurityException) {}
+                        } else if (gatt === g) {
+                            // Remote disconnection after fully connected.
+                            cleanupConnection()
+                            broadcastState("disconnected")
                         } else {
-                            // Remote disconnection after fully connected
-                            connectionStateCallback?.invoke("disconnected")
+                            try { g.close() } catch (_: SecurityException) {}
                         }
-
-                        try { g.close() } catch (_: SecurityException) {
-                            // Ignore — we're disconnecting anyway
-                        }
-                        
-                        gatt = null
-                        txCharacteristic = null
                     }
                 }
             }
 
             override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
-                negotiatedMtu = if (status == BluetoothGatt.GATT_SUCCESS) mtu - 3 else 20
+                sharedMainHandler.post {
+                    negotiatedMtu = if (status == BluetoothGatt.GATT_SUCCESS) mtu - 3 else 20
+                }
                 try {
                     g.discoverServices()
                 } catch (e: SecurityException) {
-                    mainHandler.post {
-                        mainHandler.removeCallbacks(timeoutRunnable)
-                        connectResult?.error("PERMISSION_DENIED", "Service discovery denied", e.message)
-                        connectResult = null
+                    sharedMainHandler.post {
+                        sharedMainHandler.removeCallbacks(timeoutRunnable)
+                        failPendingConnects("PERMISSION_DENIED", "Service discovery denied")
                     }
                 }
             }
 
             override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
                 if (status != BluetoothGatt.GATT_SUCCESS) {
-                    mainHandler.post {
-                        mainHandler.removeCallbacks(timeoutRunnable)
-                        connectResult?.error("SERVICE_DISCOVERY_FAILED", "GATT service discovery failed with status $status", null)
-                        connectResult = null
+                    sharedMainHandler.post {
+                        sharedMainHandler.removeCallbacks(timeoutRunnable)
+                        failPendingConnects(
+                            "SERVICE_DISCOVERY_FAILED",
+                            "GATT service discovery failed with status $status"
+                        )
                         try { g.disconnect(); g.close() } catch (_: SecurityException) {}
-                        gatt = null
                     }
                     return
                 }
@@ -258,9 +366,9 @@ class BleManager(private val context: Context) {
                 var foundChar: BluetoothGattCharacteristic? = null
 
                 // 1. Try target service/characteristic UUIDs
-                val targetService = g.getService(targetServiceUuid)
-                if (targetService != null) {
-                    val c = targetService.getCharacteristic(targetCharUuid)
+                val service = g.getService(targetService)
+                if (service != null) {
+                    val c = service.getCharacteristic(targetChar)
                     if (c != null && isWritable(c)) {
                         foundChar = c
                     }
@@ -268,8 +376,8 @@ class BleManager(private val context: Context) {
 
                 // 2. Fallback: any writable characteristic
                 if (foundChar == null) {
-                    for (service in g.services) {
-                        for (c in service.characteristics) {
+                    for (svc in g.services) {
+                        for (c in svc.characteristics) {
                             if (isWritable(c)) {
                                 foundChar = c
                                 break
@@ -279,25 +387,31 @@ class BleManager(private val context: Context) {
                     }
                 }
 
-                mainHandler.post {
-                    mainHandler.removeCallbacks(timeoutRunnable)
+                sharedMainHandler.post {
+                    sharedMainHandler.removeCallbacks(timeoutRunnable)
                     if (foundChar == null) {
-                        connectResult?.error("NO_CHARACTERISTIC", "No writable characteristic found", null)
-                        connectResult = null
+                        failPendingConnects("NO_CHARACTERISTIC", "No writable characteristic found")
                         try { g.disconnect(); g.close() } catch (_: SecurityException) {}
-                        gatt = null
-                    } else {
-                        txCharacteristic = foundChar
-                        // Prefer write-with-response for reliable backpressure; the printer
-                        // ACKs each chunk before we send the next, preventing buffer overflow.
-                        // Fall back to write-without-response only if that is the sole option.
-                        writeWithoutResponse =
-                            (foundChar.properties and BluetoothGattCharacteristic.PROPERTY_WRITE) == 0 &&
-                            (foundChar.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
-                        connectResult?.success(null)
-                        connectResult = null
-                        connectionStateCallback?.invoke("connected")
+                        return@post
                     }
+
+                    gatt = g
+                    connectedDeviceId = deviceId
+                    txCharacteristic = foundChar
+                    // Prefer write-with-response for reliable backpressure; the printer
+                    // ACKs each chunk before we send the next, preventing buffer overflow.
+                    // Fall back to write-without-response only if that is the sole option.
+                    writeWithoutResponse =
+                        (foundChar.properties and BluetoothGattCharacteristic.PROPERTY_WRITE) == 0 &&
+                        (foundChar.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
+
+                    for ((manager, res) in pendingConnects) {
+                        leaseHolders.add(manager)
+                        res.success(null)
+                        manager.connectionStateCallback?.invoke("connected")
+                    }
+                    pendingConnects.clear()
+                    connectingDeviceId = null
                 }
             }
 
@@ -306,14 +420,7 @@ class BleManager(private val context: Context) {
                 characteristic: BluetoothGattCharacteristic,
                 status: Int
             ) {
-                mainHandler.post {
-                    if (status == BluetoothGatt.GATT_SUCCESS) {
-                        writeResult?.success(null)
-                    } else {
-                        writeResult?.error("WRITE_FAILED", "BLE write failed with status $status", null)
-                    }
-                    writeResult = null
-                }
+                sharedMainHandler.post { onChunkAck(status) }
             }
         }
 
@@ -327,15 +434,14 @@ class BleManager(private val context: Context) {
         }
 
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            attemptGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 device.connectGatt(context, isBonded, gattCallback, BluetoothDevice.TRANSPORT_LE)
             } else {
                 device.connectGatt(context, isBonded, gattCallback)
             }
         } catch (e: SecurityException) {
-            mainHandler.removeCallbacks(timeoutRunnable)
-            connectResult = null
-            result.error("PERMISSION_DENIED", "Bluetooth connect permission denied", e.message)
+            sharedMainHandler.removeCallbacks(timeoutRunnable)
+            failPendingConnects("PERMISSION_DENIED", "Bluetooth connect permission denied")
         }
     }
 
@@ -348,77 +454,129 @@ class BleManager(private val context: Context) {
     }
 
     fun write(data: ByteArray, withoutResponse: Boolean, result: MethodChannel.Result) {
-        val g = gatt
-        val char = txCharacteristic
-        if (g == null || char == null) {
+        if (gatt == null || txCharacteristic == null) {
             result.error("NOT_CONNECTED", "BLE device not connected", null)
             return
         }
 
-        writeResult = result
+        val chunkSize = if (negotiatedMtu > 0) negotiatedMtu else 20
+        val chunks = mutableListOf<ByteArray>()
+        var offset = 0
+        while (offset < data.size) {
+            val end = minOf(offset + chunkSize, data.size)
+            chunks.add(data.copyOfRange(offset, end))
+            offset = end
+        }
+
+        if (chunks.isEmpty()) {
+            result.success(null)
+            return
+        }
+
+        jobQueue.add(WriteJob(chunks, withoutResponse, result))
+        pumpJobs()
+    }
+
+    // Main thread only.
+    private fun pumpJobs() {
+        if (activeJob != null) return
+        activeJob = jobQueue.poll() ?: return
+        writeNextChunk()
+    }
+
+    // Main thread only.
+    private fun writeNextChunk() {
+        val job = activeJob ?: return
+
+        if (job.index >= job.chunks.size) {
+            activeJob = null
+            job.result.success(null)
+            pumpJobs()
+            return
+        }
+
+        val g = gatt
+        val char = txCharacteristic
+        if (g == null || char == null) {
+            activeJob = null
+            job.result.error("NOT_CONNECTED", "BLE device not connected", null)
+            pumpJobs()
+            return
+        }
+
+        val chunk = job.chunks[job.index]
 
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 // Android 13+ uses new writeCharacteristic API
-                val writeType = if (withoutResponse)
+                val writeType = if (job.withoutResponse)
                     BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
                 else
                     BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                
-                    val writeResult = g.writeCharacteristic(char, data, writeType)
-                if (writeResult != BluetoothStatusCodes.SUCCESS) {
-                    this.writeResult?.error("WRITE_FAILED", "writeCharacteristic returned $writeResult", null)
-                    this.writeResult = null
+
+                val status = g.writeCharacteristic(char, chunk, writeType)
+                if (status != BluetoothStatusCodes.SUCCESS) {
+                    activeJob = null
+                    job.result.error("WRITE_FAILED", "writeCharacteristic returned $status", null)
+                    pumpJobs()
                 }
             } else {
                 @Suppress("DEPRECATION")
-                char.writeType = if (withoutResponse)
+                char.writeType = if (job.withoutResponse)
                     BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
                 else
                     BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                
+
                 @Suppress("DEPRECATION")
-                char.value = data
-                
+                char.value = chunk
+
                 @Suppress("DEPRECATION")
                 val success = g.writeCharacteristic(char)
                 if (!success) {
-                    this.writeResult?.error("WRITE_FAILED", "writeCharacteristic returned false", null)
-                    this.writeResult = null
+                    activeJob = null
+                    job.result.error("WRITE_FAILED", "writeCharacteristic returned false", null)
+                    pumpJobs()
                 }
             }
         } catch (e: SecurityException) {
-            writeResult?.error("PERMISSION_DENIED", "Bluetooth write permission denied", e.message)
-            writeResult = null
+            activeJob = null
+            job.result.error("PERMISSION_DENIED", "Bluetooth write permission denied", e.message)
+            pumpJobs()
+        }
+    }
+
+    // Main thread only. Called from onCharacteristicWrite for each chunk.
+    private fun onChunkAck(status: Int) {
+        val job = activeJob ?: return
+        if (status == BluetoothGatt.GATT_SUCCESS) {
+            job.index++
+            writeNextChunk()
+        } else {
+            activeJob = null
+            job.result.error("WRITE_FAILED", "BLE write failed with status $status", null)
+            pumpJobs()
         }
     }
 
     fun disconnect(result: MethodChannel.Result) {
-        try {
-            gatt?.disconnect()
-            gatt?.close()
-        } catch (_: SecurityException) {
-            // Ignore — we're disconnecting anyway
-        }
-        
-        gatt = null
-        txCharacteristic = null
+        releaseLease()
         connectionStateCallback?.invoke("disconnected")
         result.success(null)
     }
 
     fun dispose() {
         stopScanInternal()
+        instances.remove(this)
+        releaseLease()
+    }
 
-        try {
-            gatt?.disconnect()
-            gatt?.close()
-        } catch (_: SecurityException) {
-            // Ignore — we're disposing anyway
+    // Main thread only. Closes the GATT only when the last isolate holding
+    // the connection releases it.
+    private fun releaseLease() {
+        leaseHolders.remove(this)
+        if (leaseHolders.isEmpty() && connectingDeviceId == null) {
+            cleanupConnection()
         }
-        
-        gatt = null
-        txCharacteristic = null
     }
 
     private fun isWritable(c: BluetoothGattCharacteristic): Boolean {

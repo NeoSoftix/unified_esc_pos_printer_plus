@@ -15,6 +15,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import io.flutter.plugin.common.MethodChannel
+import java.util.concurrent.Executors
 
 /**
  * Talks to USB Printer Class (interface class 0x07) devices directly via
@@ -31,15 +32,45 @@ class UsbPrinterClassManager(private val context: Context) {
             "com.elriztechnology.unified_esc_pos_printer.USB_PERMISSION"
         private const val WRITE_CHUNK_SIZE = 16 * 1024
         private const val WRITE_TIMEOUT_MS = 5000
+
+        // The USB connection is shared process-wide. Background isolates
+        // attach their own plugin instance, so the claimed interface must not
+        // be owned by a single engine (issue #21).
+        //
+        // All connection state below is confined to the single-threaded [ops]
+        // executor: opens, writes, and closes run on it in FIFO order, which
+        // makes each write call an atomic print job.
+        private val ops = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "unified-esc-pos-usb").apply { isDaemon = true }
+        }
+
+        private var connection: UsbDeviceConnection? = null
+        private var claimedInterface: UsbInterface? = null
+        private var bulkOut: UsbEndpoint? = null
+        private var connectedKey: String? = null
+
+        // Instances (one per Flutter engine) currently holding the
+        // connection. It closes only when the last lease is released.
+        private val leaseHolders = mutableSetOf<UsbPrinterClassManager>()
+
+        // Runs on the ops thread.
+        private fun closeConnection() {
+            val conn = connection
+            val itf = claimedInterface
+            if (conn != null && itf != null) {
+                try { conn.releaseInterface(itf) } catch (_: Exception) {}
+            }
+            try { conn?.close() } catch (_: Exception) {}
+            connection = null
+            claimedInterface = null
+            bulkOut = null
+            connectedKey = null
+        }
     }
 
     private val usbManager: UsbManager =
         context.getSystemService(Context.USB_SERVICE) as UsbManager
     private val mainHandler = Handler(Looper.getMainLooper())
-
-    private var connection: UsbDeviceConnection? = null
-    private var claimedInterface: UsbInterface? = null
-    private var bulkOut: UsbEndpoint? = null
 
     private var permissionReceiver: BroadcastReceiver? = null
 
@@ -120,72 +151,107 @@ class UsbPrinterClassManager(private val context: Context) {
     }
 
     private fun openDeviceInternal(device: UsbDevice, result: MethodChannel.Result) {
-        val conn = usbManager.openDevice(device)
-        if (conn == null) {
-            mainHandler.post {
-                result.error("OPEN_FAILED", "Could not open USB device", null)
+        val key = "${device.vendorId}:${device.productId}"
+
+        ops.execute {
+            // Reuse the live connection when another isolate (or this one)
+            // already opened the same printer.
+            if (connectedKey == key && connection != null) {
+                leaseHolders.add(this)
+                mainHandler.post {
+                    connectionStateCallback?.invoke("connected")
+                    result.success(null)
+                }
+                return@execute
             }
-            return
-        }
 
-        var printerInterface: UsbInterface? = null
-        var outEndpoint: UsbEndpoint? = null
+            // Connected to a different printer: only tear it down when no
+            // other isolate still holds it.
+            val othersHold = leaseHolders.any { it !== this }
+            if (connection != null && othersHold) {
+                mainHandler.post {
+                    result.error(
+                        "PRINTER_BUSY",
+                        "Another print job is using the USB connection",
+                        null
+                    )
+                }
+                return@execute
+            }
 
-        outer@ for (i in 0 until device.interfaceCount) {
-            val itf = device.getInterface(i)
-            if (itf.interfaceClass != UsbConstants.USB_CLASS_PRINTER) continue
-            for (e in 0 until itf.endpointCount) {
-                val ep = itf.getEndpoint(e)
-                if (ep.direction == UsbConstants.USB_DIR_OUT &&
-                    ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK
-                ) {
-                    printerInterface = itf
-                    outEndpoint = ep
-                    break@outer
+            closeConnection()
+            leaseHolders.clear()
+
+            val conn = usbManager.openDevice(device)
+            if (conn == null) {
+                mainHandler.post {
+                    result.error("OPEN_FAILED", "Could not open USB device", null)
+                }
+                return@execute
+            }
+
+            var printerInterface: UsbInterface? = null
+            var outEndpoint: UsbEndpoint? = null
+
+            outer@ for (i in 0 until device.interfaceCount) {
+                val itf = device.getInterface(i)
+                if (itf.interfaceClass != UsbConstants.USB_CLASS_PRINTER) continue
+                for (e in 0 until itf.endpointCount) {
+                    val ep = itf.getEndpoint(e)
+                    if (ep.direction == UsbConstants.USB_DIR_OUT &&
+                        ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK
+                    ) {
+                        printerInterface = itf
+                        outEndpoint = ep
+                        break@outer
+                    }
                 }
             }
-        }
 
-        if (printerInterface == null || outEndpoint == null) {
-            conn.close()
-            mainHandler.post {
-                result.error(
-                    "NO_PRINTER_INTERFACE",
-                    "No USB Printer Class interface with bulk-OUT endpoint found",
-                    null
-                )
+            if (printerInterface == null || outEndpoint == null) {
+                conn.close()
+                mainHandler.post {
+                    result.error(
+                        "NO_PRINTER_INTERFACE",
+                        "No USB Printer Class interface with bulk-OUT endpoint found",
+                        null
+                    )
+                }
+                return@execute
             }
-            return
-        }
 
-        if (!conn.claimInterface(printerInterface, true)) {
-            conn.close()
-            mainHandler.post {
-                result.error("CLAIM_FAILED", "Could not claim USB printer interface", null)
+            if (!conn.claimInterface(printerInterface, true)) {
+                conn.close()
+                mainHandler.post {
+                    result.error("CLAIM_FAILED", "Could not claim USB printer interface", null)
+                }
+                return@execute
             }
-            return
-        }
 
-        cleanupConnection()
-        connection = conn
-        claimedInterface = printerInterface
-        bulkOut = outEndpoint
+            connection = conn
+            claimedInterface = printerInterface
+            bulkOut = outEndpoint
+            connectedKey = key
+            leaseHolders.add(this)
 
-        mainHandler.post {
-            connectionStateCallback?.invoke("connected")
-            result.success(null)
+            mainHandler.post {
+                connectionStateCallback?.invoke("connected")
+                result.success(null)
+            }
         }
     }
 
     fun write(data: ByteArray, result: MethodChannel.Result) {
-        val conn = connection
-        val endpoint = bulkOut
-        if (conn == null || endpoint == null) {
-            result.error("NOT_CONNECTED", "USB printer not connected", null)
-            return
-        }
+        ops.execute {
+            val conn = connection
+            val endpoint = bulkOut
+            if (conn == null || endpoint == null) {
+                mainHandler.post {
+                    result.error("NOT_CONNECTED", "USB printer not connected", null)
+                }
+                return@execute
+            }
 
-        Thread {
             try {
                 var offset = 0
                 while (offset < data.size) {
@@ -204,7 +270,7 @@ class UsbPrinterClassManager(private val context: Context) {
                                 null
                             )
                         }
-                        return@Thread
+                        return@execute
                     }
                     offset += written
                 }
@@ -214,18 +280,22 @@ class UsbPrinterClassManager(private val context: Context) {
                     result.error("WRITE_FAILED", "USB write failed", e.message)
                 }
             }
-        }.start()
+        }
     }
 
     fun close(result: MethodChannel.Result) {
-        cleanupConnection()
-        connectionStateCallback?.invoke("disconnected")
-        result.success(null)
+        ops.execute {
+            releaseLease()
+            mainHandler.post {
+                connectionStateCallback?.invoke("disconnected")
+                result.success(null)
+            }
+        }
     }
 
     fun dispose() {
         unregisterPermissionReceiver()
-        cleanupConnection()
+        ops.execute { releaseLease() }
     }
 
     private fun findDevice(vid: Int, pid: Int): UsbDevice? {
@@ -234,16 +304,13 @@ class UsbPrinterClassManager(private val context: Context) {
         }
     }
 
-    private fun cleanupConnection() {
-        val conn = connection
-        val itf = claimedInterface
-        if (conn != null && itf != null) {
-            try { conn.releaseInterface(itf) } catch (_: Exception) {}
+    // Runs on the ops thread. Closes the connection only when the last
+    // isolate holding it releases its lease.
+    private fun releaseLease() {
+        leaseHolders.remove(this)
+        if (leaseHolders.isEmpty()) {
+            closeConnection()
         }
-        try { conn?.close() } catch (_: Exception) {}
-        connection = null
-        claimedInterface = null
-        bulkOut = null
     }
 
     private fun unregisterPermissionReceiver() {

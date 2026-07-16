@@ -20,8 +20,10 @@ import 'printer_connector.dart';
 /// **Discovery:** Returns paired devices immediately via bonded device query,
 /// then streams additional devices found during discovery.
 ///
-/// **Writing:** Data is chunked into [chunkSize] byte blocks. [disconnect]
-/// waits for the OS RFCOMM buffer to drain so jobs are not truncated.
+/// **Writing:** Each write is handed to the platform as a single job, so
+/// concurrent jobs (including ones from other isolates) cannot interleave.
+/// [disconnect] waits for the OS RFCOMM buffer to drain so jobs are not
+/// truncated.
 ///
 /// **Permissions:** Automatically requests Bluetooth permissions when
 /// scanning or connecting. Throws [PrinterPermissionException] if denied.
@@ -32,7 +34,10 @@ class BluetoothConnector extends PrinterConnector<BluetoothPrinterDevice> {
     this.maxDrainWait = const Duration(milliseconds: kMaxDrainWaitMs),
   });
 
-  /// Maximum bytes per Bluetooth write operation.
+  /// Retained for backward compatibility; no longer used. Print jobs are
+  /// handed to the platform in a single write call so concurrent jobs
+  /// cannot interleave (issue #21).
+  @Deprecated('No longer used; writes are sent as a single job')
   final int chunkSize;
 
   /// Link throughput estimate used to compute drain time.
@@ -249,12 +254,10 @@ class BluetoothConnector extends PrinterConnector<BluetoothPrinterDevice> {
     final DateTime writeStart = DateTime.now();
 
     try {
-      for (int i = 0; i < bytes.length; i += chunkSize) {
-        final int end = (i + chunkSize).clamp(0, bytes.length);
-        await _platform.btWrite(
-          data: Uint8List.fromList(bytes.sublist(i, end)),
-        );
-      }
+      // The full job is handed to the platform in a single call so that
+      // concurrent jobs from other isolates cannot interleave with it
+      // (issue #21); the native side serializes whole write calls.
+      await _platform.btWrite(data: Uint8List.fromList(bytes));
 
       _drain.onWrite(bytes.length, writeStart, DateTime.now());
       _setState(PrinterConnectionState.connected);
