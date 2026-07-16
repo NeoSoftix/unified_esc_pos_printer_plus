@@ -88,6 +88,13 @@ class BleManager {
   void StopScanInternal();
   void Cleanup();
 
+  void OnAdvertisementReceived(
+      winrt::Windows::Devices::Bluetooth::Advertisement::
+          BluetoothLEAdvertisementReceivedEventArgs const& args);
+  // Add the device or upgrade its placeholder name; returns true if changed.
+  bool UpsertDevice(const std::string& device_id, const std::string& name);
+  void EmitDeviceList();
+
   winrt::guid ParseUuid(const std::string& uuid_str);
 
   PlatformThreadDispatcher* dispatcher_ = nullptr;
