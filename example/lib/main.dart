@@ -138,6 +138,13 @@ class _PrinterDemoPageState extends State<PrinterDemoPage> {
       ticket.cut();
 
       await _manager.printTicket(ticket);
+
+      // printTicket() resolves once the data is accepted by the transport.
+      // Wait until it has fully reached the printer before reporting success.
+      // disconnect() performs this wait automatically, so the explicit
+      // barrier is only needed when staying connected.
+      await _manager.waitWriteComplete();
+
       _showSnack('Ticket printed!');
     } on PrinterException catch (e) {
       _showSnack('Print failed: ${e.message}');
