@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import '../core/commands.dart';
 import '../exceptions/printer_exception.dart';
 import '../models/printer_connection_state.dart';
 import '../models/printer_device.dart';
@@ -16,15 +17,25 @@ import 'printer_connector.dart';
 /// falls back to any writable characteristic found.
 ///
 /// **Writing:** Negotiates MTU 512 after connecting and chunks data into
-/// MTU-sized write operations.
+/// MTU-sized write operations. Write-without-response data is drained
+/// before [disconnect] closes the link.
 ///
 /// **Permissions:** Automatically requests Bluetooth permissions when
 /// scanning or connecting. Throws [PrinterPermissionException] if denied.
 class BleConnector extends PrinterConnector<BlePrinterDevice> {
+  BleConnector({
+    this.writeWithoutResponseDrainDelay =
+        const Duration(milliseconds: kBleWwrDrainDelayMs),
+  });
+
+  /// Drain delay applied after write-without-response data.
+  final Duration writeWithoutResponseDrainDelay;
+
   final BluetoothPlatformChannel _platform = BluetoothPlatformChannel.instance;
 
   int _mtuPayload = 20;
   bool _writeWithoutResponse = false;
+  bool _pendingWwrDrain = false;
   StreamSubscription<Map<String, dynamic>>? _connectionSub;
 
   PrinterConnectionState _state = PrinterConnectionState.disconnected;
@@ -208,8 +219,10 @@ class BleConnector extends PrinterConnector<BlePrinterDevice> {
         );
       }
 
+      if (_writeWithoutResponse) _pendingWwrDrain = true;
       _setState(PrinterConnectionState.connected);
     } catch (e) {
+      _pendingWwrDrain = false;
       _setState(PrinterConnectionState.error);
       _setState(PrinterConnectionState.disconnected);
       throw PrinterWriteException('BLE write failed', cause: e);
@@ -217,9 +230,22 @@ class BleConnector extends PrinterConnector<BlePrinterDevice> {
   }
 
   @override
+  Future<void> waitWriteComplete() async {
+    if (!_pendingWwrDrain) return;
+    await Future<void>.delayed(writeWithoutResponseDrainDelay);
+    _pendingWwrDrain = false;
+  }
+
+  @override
   Future<void> disconnect() async {
     if (_state == PrinterConnectionState.disconnected) return;
 
+    // Cancelling the connection drops chunks still queued in the BLE stack.
+    if (_state == PrinterConnectionState.connected) {
+      await waitWriteComplete();
+    }
+
+    _pendingWwrDrain = false;
     _setState(PrinterConnectionState.disconnecting);
 
     await _connectionSub?.cancel();

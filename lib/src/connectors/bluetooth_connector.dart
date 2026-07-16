@@ -7,6 +7,7 @@ import '../exceptions/printer_exception.dart';
 import '../models/printer_connection_state.dart';
 import '../models/printer_device.dart';
 import '../platform/bluetooth_platform_channel.dart';
+import '../utils/drain_estimator.dart';
 import 'printer_connector.dart';
 
 /// Connector for Bluetooth Classic (SPP) ESC/POS printers.
@@ -17,15 +18,32 @@ import 'printer_connector.dart';
 /// **Discovery:** Returns paired devices immediately via bonded device query,
 /// then streams additional devices found during discovery.
 ///
-/// **Writing:** Data is chunked into [chunkSize] byte blocks.
+/// **Writing:** Data is chunked into [chunkSize] byte blocks. [disconnect]
+/// waits for the OS RFCOMM buffer to drain so jobs are not truncated.
 ///
 /// **Permissions:** Automatically requests Bluetooth permissions when
 /// scanning or connecting. Throws [PrinterPermissionException] if denied.
 class BluetoothConnector extends PrinterConnector<BluetoothPrinterDevice> {
-  BluetoothConnector({this.chunkSize = kDefaultBtChunkSize});
+  BluetoothConnector({
+    this.chunkSize = kDefaultBtChunkSize,
+    this.drainBytesPerSecond = kBtDrainBytesPerSecond,
+    this.maxDrainWait = const Duration(milliseconds: kMaxDrainWaitMs),
+  });
 
   /// Maximum bytes per Bluetooth write operation.
   final int chunkSize;
+
+  /// Link throughput estimate used to compute drain time.
+  final int drainBytesPerSecond;
+
+  /// Upper bound on the drain wait.
+  final Duration maxDrainWait;
+
+  late final DrainEstimator _drain = DrainEstimator(
+    bytesPerSecond: drainBytesPerSecond,
+    assumedBufferBytes: kDrainBufferBytes,
+    maxWait: maxDrainWait,
+  );
 
   final BluetoothPlatformChannel _platform = BluetoothPlatformChannel.instance;
   StreamSubscription<Map<String, dynamic>>? _connectionSub;
@@ -221,6 +239,8 @@ class BluetoothConnector extends PrinterConnector<BluetoothPrinterDevice> {
     _assertState(PrinterConnectionState.connected, 'writeBytes');
     _setState(PrinterConnectionState.printing);
 
+    final DateTime writeStart = DateTime.now();
+
     try {
       for (int i = 0; i < bytes.length; i += chunkSize) {
         final int end = (i + chunkSize).clamp(0, bytes.length);
@@ -229,19 +249,29 @@ class BluetoothConnector extends PrinterConnector<BluetoothPrinterDevice> {
         );
       }
 
+      _drain.onWrite(bytes.length, writeStart, DateTime.now());
       _setState(PrinterConnectionState.connected);
     } catch (e) {
+      _drain.reset();
       _setState(PrinterConnectionState.error);
       _setState(PrinterConnectionState.disconnected);
       throw PrinterWriteException('Bluetooth write failed', cause: e);
     }
   }
 
+  @override
+  Future<void> waitWriteComplete() => _drain.wait();
+
   // ── Disconnection ──────────────────────────────────────────────────────────
 
   @override
   Future<void> disconnect() async {
     if (_state == PrinterConnectionState.disconnected) return;
+
+    // Closing the socket discards data still queued in the RFCOMM buffer.
+    if (_state == PrinterConnectionState.connected) {
+      await waitWriteComplete();
+    }
 
     _setState(PrinterConnectionState.disconnecting);
 
@@ -251,6 +281,7 @@ class BluetoothConnector extends PrinterConnector<BluetoothPrinterDevice> {
     try {
       await _platform.btDisconnect();
     } finally {
+      _drain.reset();
       _setState(PrinterConnectionState.disconnected);
     }
   }

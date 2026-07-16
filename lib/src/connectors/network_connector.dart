@@ -175,6 +175,18 @@ class NetworkConnector extends PrinterConnector<NetworkPrinterDevice> {
     }
   }
 
+  @override
+  Future<void> waitWriteComplete() async {
+    final Socket? socket = _socket;
+    if (socket == null) return;
+
+    try {
+      await socket.flush();
+    } catch (_) {
+      // Connection already broken; disconnect() handles teardown.
+    }
+  }
+
   // ── Disconnection ──────────────────────────────────────────────────────────
 
   @override

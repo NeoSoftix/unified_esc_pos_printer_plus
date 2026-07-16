@@ -175,7 +175,8 @@ class PrinterManager {
     await connector.connect(device, timeout: timeout);
   }
 
-  /// Disconnect from the currently connected printer.
+  /// Disconnect from the currently connected printer, draining buffered
+  /// write data first so a job printed just before is not truncated.
   Future<void> disconnect() async {
     await _activeStateSub?.cancel();
     _activeStateSub = null;
@@ -199,6 +200,14 @@ class PrinterManager {
   Future<void> printBytes(List<int> bytes) async {
     _assertConnected('printBytes');
     await _active!.writeBytes(bytes);
+  }
+
+  /// Wait until data from previous print calls has finished transmitting.
+  ///
+  /// [disconnect] performs this wait internally; call it directly when you
+  /// need the barrier without disconnecting.
+  Future<void> waitWriteComplete() async {
+    await _active?.waitWriteComplete();
   }
 
   /// Open the cash drawer connected to [pin] (default: pin 2).

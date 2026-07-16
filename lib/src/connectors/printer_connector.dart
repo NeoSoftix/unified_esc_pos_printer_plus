@@ -39,7 +39,12 @@ abstract class PrinterConnector<T extends PrinterDevice> {
   /// Throws [PrinterWriteException] if the write fails.
   Future<void> writeBytes(List<int> bytes);
 
-  /// Disconnect from the current printer.
+  /// Wait until bytes from previous [writeBytes] calls have finished
+  /// transmitting. [disconnect] calls this internally; the default
+  /// implementation completes immediately.
+  Future<void> waitWriteComplete() async {}
+
+  /// Disconnect from the current printer, draining buffered write data first.
   Future<void> disconnect();
 
   /// Release all resources held by this connector (streams, subscriptions).
