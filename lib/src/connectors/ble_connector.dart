@@ -101,11 +101,14 @@ class BleConnector extends PrinterConnector<BlePrinterDevice> {
       (devices) {
         for (final Map<String, dynamic> d in devices) {
           final String id = d['deviceId'] as String;
-          if (!found.any((dev) => dev.deviceId == id)) {
-            found.add(BlePrinterDevice(
-              name: (d['name'] as String?) ?? id,
-              deviceId: id,
-            ));
+          final String name = (d['name'] as String?) ?? id;
+          final int existing = found.indexWhere((dev) => dev.deviceId == id);
+          if (existing == -1) {
+            found.add(BlePrinterDevice(name: name, deviceId: id));
+          } else if (name != id && found[existing].name == id) {
+            // The native side resolved a friendly name after first emitting
+            // the device with its address as a placeholder.
+            found[existing] = BlePrinterDevice(name: name, deviceId: id);
           }
         }
       },

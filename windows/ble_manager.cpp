@@ -122,91 +122,30 @@ void BleManager::StartScan(
     resolved_addresses_.clear();
   }
 
-  watcher_ = BluetoothLEAdvertisementWatcher();
-  watcher_.ScanningMode(BluetoothLEScanningMode::Active);
+  try {
+    watcher_ = BluetoothLEAdvertisementWatcher();
+    watcher_.ScanningMode(BluetoothLEScanningMode::Active);
 
-  watcher_received_token_ = watcher_.Received(
-      [this](BluetoothLEAdvertisementWatcher const&,
-             BluetoothLEAdvertisementReceivedEventArgs const& args) {
-        auto address = args.BluetoothAddress();
-        std::ostringstream oss;
-        oss << std::hex << std::setfill('0');
-        oss << std::setw(2) << ((address >> 40) & 0xFF) << ":"
-            << std::setw(2) << ((address >> 32) & 0xFF) << ":"
-            << std::setw(2) << ((address >> 24) & 0xFF) << ":"
-            << std::setw(2) << ((address >> 16) & 0xFF) << ":"
-            << std::setw(2) << ((address >> 8) & 0xFF) << ":"
-            << std::setw(2) << (address & 0xFF);
-        std::string device_id = oss.str();
+    watcher_received_token_ = watcher_.Received(
+        [this](BluetoothLEAdvertisementWatcher const&,
+               BluetoothLEAdvertisementReceivedEventArgs const& args) {
+          // An exception escaping this WinRT event handler terminates the
+          // process, so nothing may throw past this boundary.
+          try {
+            OnAdvertisementReceived(args);
+          } catch (...) {}
+        });
 
-        // Try to get name from advertisement data first.
-        std::string name;
-        auto local_name = args.Advertisement().LocalName();
-        if (!local_name.empty()) {
-          name = winrt::to_string(local_name);
-        }
-
-        // If no name in advertisement, resolve via BluetoothLEDevice (once
-        // per address to avoid repeated lookups).
-        if (name.empty()) {
-          bool already_resolved = false;
-          {
-            std::lock_guard<std::mutex> lock(scan_mutex_);
-            already_resolved = resolved_addresses_.count(address) > 0;
-            resolved_addresses_.insert(address);
-          }
-          if (!already_resolved) {
-            try {
-              auto ble_device = BluetoothLEDevice::FromBluetoothAddressAsync(address).get();
-              if (ble_device != nullptr) {
-                auto friendly_name = ble_device.Name();
-                if (!friendly_name.empty()) {
-                  name = winrt::to_string(friendly_name);
-                }
-                ble_device.Close();
-              }
-            } catch (...) {
-              // Fall through — use MAC address as name.
-            }
-          }
-          if (name.empty()) {
-            name = device_id;
-          }
-        }
-
-        std::lock_guard<std::mutex> lock(scan_mutex_);
-        bool exists = std::any_of(
-            discovered_devices_.begin(), discovered_devices_.end(),
-            [&device_id](const flutter::EncodableMap& m) {
-              auto it = m.find(flutter::EncodableValue("deviceId"));
-              return it != m.end() &&
-                     std::get<std::string>(it->second) == device_id;
-            });
-
-        if (!exists) {
-          flutter::EncodableMap device_map;
-          device_map[flutter::EncodableValue("deviceId")] =
-              flutter::EncodableValue(device_id);
-          device_map[flutter::EncodableValue("name")] =
-              flutter::EncodableValue(name);
-          discovered_devices_.push_back(device_map);
-
-          if (scan_event_sink_ && dispatcher_) {
-            flutter::EncodableList list;
-            for (const auto& d : discovered_devices_) {
-              list.push_back(flutter::EncodableValue(d));
-            }
-            auto value = flutter::EncodableValue(list);
-            dispatcher_->Post([this, value = std::move(value)]() {
-              if (scan_event_sink_) {
-                scan_event_sink_->Success(value);
-              }
-            });
-          }
-        }
-      });
-
-  watcher_.Start();
+    watcher_.Start();
+  } catch (const winrt::hresult_error& e) {
+    StopScanInternal();
+    result->Error("SCAN_FAILED", winrt::to_string(e.message()));
+    return;
+  } catch (const std::exception& e) {
+    StopScanInternal();
+    result->Error("SCAN_FAILED", e.what());
+    return;
+  }
 
   // Auto-stop after timeout
   std::thread([this, timeout_ms]() {
@@ -215,6 +154,115 @@ void BleManager::StartScan(
   }).detach();
 
   result->Success(flutter::EncodableValue());
+}
+
+void BleManager::OnAdvertisementReceived(
+    BluetoothLEAdvertisementReceivedEventArgs const& args) {
+  auto address = args.BluetoothAddress();
+  std::ostringstream oss;
+  oss << std::hex << std::setfill('0');
+  oss << std::setw(2) << ((address >> 40) & 0xFF) << ":"
+      << std::setw(2) << ((address >> 32) & 0xFF) << ":"
+      << std::setw(2) << ((address >> 24) & 0xFF) << ":"
+      << std::setw(2) << ((address >> 16) & 0xFF) << ":"
+      << std::setw(2) << ((address >> 8) & 0xFF) << ":"
+      << std::setw(2) << (address & 0xFF);
+  std::string device_id = oss.str();
+
+  // Try to get name from advertisement data first. Advertisement() can be
+  // null for some advertisement types (e.g. extended advertising).
+  std::string name;
+  auto advertisement = args.Advertisement();
+  if (advertisement != nullptr) {
+    auto local_name = advertisement.LocalName();
+    if (!local_name.empty()) {
+      name = winrt::to_string(local_name);
+    }
+  }
+
+  bool needs_resolve = false;
+  if (name.empty()) {
+    std::lock_guard<std::mutex> lock(scan_mutex_);
+    needs_resolve = resolved_addresses_.count(address) == 0;
+    resolved_addresses_.insert(address);
+    name = device_id;
+  }
+
+  if (UpsertDevice(device_id, name)) {
+    EmitDeviceList();
+  }
+
+  // If the advertisement carried no name, resolve the friendly name via
+  // BluetoothLEDevice on a worker thread (once per address). Blocking with
+  // .get() inside the Received handler aborts the process when the event is
+  // delivered on an STA thread.
+  if (needs_resolve) {
+    std::thread([this, address, device_id]() {
+      try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+      } catch (...) {}
+      try {
+        auto ble_device =
+            BluetoothLEDevice::FromBluetoothAddressAsync(address).get();
+        if (ble_device != nullptr) {
+          auto friendly_name = ble_device.Name();
+          ble_device.Close();
+          if (!friendly_name.empty() &&
+              UpsertDevice(device_id, winrt::to_string(friendly_name))) {
+            EmitDeviceList();
+          }
+        }
+      } catch (...) {
+        // Keep the MAC address as the name.
+      }
+    }).detach();
+  }
+}
+
+bool BleManager::UpsertDevice(const std::string& device_id,
+                              const std::string& name) {
+  std::lock_guard<std::mutex> lock(scan_mutex_);
+
+  for (auto& m : discovered_devices_) {
+    auto it = m.find(flutter::EncodableValue("deviceId"));
+    if (it == m.end() || std::get<std::string>(it->second) != device_id) {
+      continue;
+    }
+    // Known device: only upgrade a placeholder (MAC address) name.
+    auto name_it = m.find(flutter::EncodableValue("name"));
+    if (name != device_id && name_it != m.end() &&
+        std::get<std::string>(name_it->second) == device_id) {
+      m[flutter::EncodableValue("name")] = flutter::EncodableValue(name);
+      return true;
+    }
+    return false;
+  }
+
+  flutter::EncodableMap device_map;
+  device_map[flutter::EncodableValue("deviceId")] =
+      flutter::EncodableValue(device_id);
+  device_map[flutter::EncodableValue("name")] = flutter::EncodableValue(name);
+  discovered_devices_.push_back(device_map);
+  return true;
+}
+
+void BleManager::EmitDeviceList() {
+  if (!dispatcher_) return;
+
+  flutter::EncodableList list;
+  {
+    std::lock_guard<std::mutex> lock(scan_mutex_);
+    for (const auto& d : discovered_devices_) {
+      list.push_back(flutter::EncodableValue(d));
+    }
+  }
+
+  auto value = flutter::EncodableValue(list);
+  dispatcher_->Post([this, value = std::move(value)]() {
+    if (scan_event_sink_) {
+      scan_event_sink_->Success(value);
+    }
+  });
 }
 
 void BleManager::StopScan(
