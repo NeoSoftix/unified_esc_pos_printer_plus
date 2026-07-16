@@ -9,8 +9,8 @@ import 'capability_profile.dart';
 import 'commands.dart';
 import 'enums.dart';
 import 'print_column.dart';
-import 'qrcode.dart';
 import 'print_text_styles.dart';
+import 'qrcode.dart';
 
 /// Low-level ESC/POS byte-command generator.
 ///
@@ -272,15 +272,13 @@ class Generator {
   }
 
   /// Apply [style], emitting all relevant ESC/POS style commands.
+  ///
+  /// Font / size / code-page first, then mode flags (bold, underline, etc.)
+  /// so emphasis is the last state change before text on picky clones.
   List<int> setStyles(PrintTextStyle style, {PrintAlign? align}) {
     List<int> bytes = [];
 
     if (align != null) bytes += _setAlign(align);
-    bytes += style.bold ? cBoldOn.codeUnits : cBoldOff.codeUnits;
-    bytes += style.turn90 ? cTurn90On.codeUnits : cTurn90Off.codeUnits;
-    bytes += style.reverse ? cReverseOn.codeUnits : cReverseOff.codeUnits;
-    bytes +=
-        style.underline ? cUnderline1dot.codeUnits : cUnderlineOff.codeUnits;
 
     final FontType font = style.fontType ?? FontType.fontA;
     bytes += font == FontType.fontB ? cFontB.codeUnits : cFontA.codeUnits;
@@ -299,6 +297,12 @@ class Generator {
           ..add(profile.getCodePageId(style.codeTable)),
       );
     }
+
+    bytes += style.bold ? cBoldOn.codeUnits : cBoldOff.codeUnits;
+    bytes += style.turn90 ? cTurn90On.codeUnits : cTurn90Off.codeUnits;
+    bytes += style.reverse ? cReverseOn.codeUnits : cReverseOff.codeUnits;
+    bytes +=
+        style.underline ? cUnderline1dot.codeUnits : cUnderlineOff.codeUnits;
 
     return bytes;
   }
@@ -425,6 +429,9 @@ class Generator {
   /// via that position, so the columns share a single printed line.
   /// Set [multiLine] to true (default) to automatically wrap overflowing
   /// column content to a subsequent row.
+  ///
+  /// Per-column styles are applied; bold columns also get a CR overstrike so
+  /// emphasis works when mid-line `ESC E` is ignored (issue #23).
   List<int> row(
     List<PrintColumn> cols, {
     bool multiLine = true,
@@ -700,6 +707,10 @@ class Generator {
   /// When [fromPx] is provided the print head is moved to that pixel position
   /// before the text. When [toPx] is also provided, right/center alignment is
   /// computed within the [fromPx]..[toPx] range.
+  ///
+  /// Positioned bold text is reinforced with a CR overstrike: many clone
+  /// printers ignore mid-line `ESC E` after `ESC $` (issue #23), same class of
+  /// limitation as mid-line `ESC a` (issue #10).
   List<int> _text(
     Uint8List textBytes, {
     PrintTextStyle style = const PrintTextStyle(),
@@ -709,6 +720,7 @@ class Generator {
     int? maxCharsPerLine,
   }) {
     List<int> bytes = [];
+    List<int>? posCmd;
 
     if (fromPx != null) {
       final charWidth = _getCharWidth(style, maxCharsPerLine: maxCharsPerLine);
@@ -727,9 +739,8 @@ class Generator {
       final String hexStr = pos.round().toRadixString(16).padLeft(3, '0');
       final List<int> hexPair = hex.decode(hexStr);
 
-      bytes += Uint8List.fromList(
-        List<int>.from(cPos.codeUnits)..addAll([hexPair[1], hexPair[0]]),
-      );
+      posCmd = List<int>.from(cPos.codeUnits)..addAll([hexPair[1], hexPair[0]]);
+      bytes += posCmd;
     }
 
     // For positioned text (table columns), horizontal alignment is realised by
@@ -739,6 +750,14 @@ class Generator {
     // lines (issue #10). So only emit ESC a for full-line text (fromPx == null).
     bytes += setStyles(style, align: fromPx == null ? align : null);
     bytes += textBytes;
+
+    // Reinforce mid-line bold via CR overstrike (issue #23).
+    if (posCmd != null && style.bold && textBytes.isNotEmpty) {
+      bytes += cCr.codeUnits;
+      bytes += posCmd;
+      bytes += textBytes;
+    }
+
     return bytes;
   }
 }

@@ -75,6 +75,9 @@ const String cAlignRight = '${esc}a2';
 /// Set absolute print position [nL] [nH]
 const String cPos = '$esc\$';
 
+/// Carriage return (return print head to start of line without feeding)
+const String cCr = '\x0D';
+
 /// Print and feed n lines [N]
 const String cFeedN = '${esc}d';
 

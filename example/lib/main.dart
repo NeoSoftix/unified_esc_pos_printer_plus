@@ -550,6 +550,103 @@ class _PrinterDemoPageState extends State<PrinterDemoPage> {
     ticket.separator();
 
     ticket.emptyLines();
+
+    ticket.text(
+      'MIXED COLUMN STYLES',
+      align: PrintAlign.center,
+      style: const PrintTextStyle(bold: true),
+    );
+    ticket.separator();
+    ticket.row([
+      PrintColumn(text: 'Regular left', flex: 2),
+      PrintColumn(
+        text: 'Bold right',
+        flex: 1,
+        align: PrintAlign.right,
+        style: const PrintTextStyle(bold: true),
+      ),
+    ]);
+    ticket.row([
+      PrintColumn(
+        text: 'Bold left',
+        flex: 2,
+        style: const PrintTextStyle(bold: true),
+      ),
+      PrintColumn(
+        text: 'Regular right',
+        flex: 1,
+        align: PrintAlign.right,
+      ),
+    ]);
+    ticket.row([
+      PrintColumn(text: 'Regular left', flex: 2),
+      PrintColumn(
+        text: 'Underline right',
+        flex: 1,
+        align: PrintAlign.right,
+        style: const PrintTextStyle(underline: true),
+      ),
+    ]);
+    ticket.row([
+      PrintColumn(
+        text: 'Underline left',
+        flex: 2,
+        style: const PrintTextStyle(underline: true),
+      ),
+      PrintColumn(
+        text: 'Regular right',
+        flex: 1,
+        align: PrintAlign.right,
+      ),
+    ]);
+    ticket.row([
+      PrintColumn(text: 'Regular left', flex: 2),
+      PrintColumn(
+        text: 'Bold + underline',
+        flex: 1,
+        align: PrintAlign.right,
+        style: const PrintTextStyle(bold: true, underline: true),
+      ),
+    ]);
+    ticket.row([
+      PrintColumn(
+        text: 'Reverse left',
+        flex: 2,
+        style: const PrintTextStyle(reverse: true),
+      ),
+      PrintColumn(
+        text: 'Regular right',
+        flex: 1,
+        align: PrintAlign.right,
+      ),
+    ]);
+    ticket.row([
+      PrintColumn(text: 'Regular left', flex: 2),
+      PrintColumn(
+        text: 'Reverse right',
+        flex: 1,
+        align: PrintAlign.right,
+        style: const PrintTextStyle(reverse: true),
+      ),
+    ]);
+    ticket.row([
+      PrintColumn(
+        text: 'Font B left',
+        flex: 1,
+        style: const PrintTextStyle(fontType: FontType.fontB),
+      ),
+      PrintColumn(
+        text: 'Size 2 right',
+        flex: 2,
+        align: PrintAlign.right,
+        style: const PrintTextStyle(
+          width: TextSize.size2,
+          height: TextSize.size2,
+        ),
+      ),
+    ]);
+
+    ticket.emptyLines();
   }
 
   // PART 3: Multilingual Text
