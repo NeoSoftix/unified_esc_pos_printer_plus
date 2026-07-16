@@ -155,3 +155,12 @@ const int kMaxDrainWaitMs = 10000;
 
 /// Drain delay after BLE write-without-response data (milliseconds)
 const int kBleWwrDrainDelayMs = 500;
+
+/// Default BLE write chunk size (bytes). `0` = negotiated MTU.
+const int kDefaultBleChunkSize = 128;
+
+/// Default BLE write throughput for pacing (bytes/second).
+const int kDefaultBleBytesPerSecond = 6 * 1024;
+
+/// Minimum pause between BLE write chunks (milliseconds).
+const int kDefaultBleChunkDelayMs = 0;

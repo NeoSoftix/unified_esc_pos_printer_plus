@@ -10,6 +10,7 @@
 #include <winrt/Windows.Storage.Streams.h>
 
 #include <algorithm>
+#include <chrono>
 #include <iomanip>
 #include <sstream>
 #include <thread>
@@ -455,6 +456,7 @@ void BleManager::SupportsWriteWithoutResponse(
 
 void BleManager::Write(
     const std::vector<uint8_t>& data, bool without_response,
+    int max_chunk_size, int chunk_delay_ms, int bytes_per_second,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
   if (tx_characteristic_ == nullptr) {
     result->Error("NOT_CONNECTED", "BLE device not connected");
@@ -465,17 +467,20 @@ void BleManager::Write(
       result.release());
   auto char_copy = tx_characteristic_;
 
-  const size_t chunk_size = mtu_payload_ >= 20 ? static_cast<size_t>(mtu_payload_) : 20;
+  const size_t mtu = mtu_payload_ >= 20 ? static_cast<size_t>(mtu_payload_) : 20;
+  const size_t chunk_size = max_chunk_size > 0
+      ? (std::min)(mtu, static_cast<size_t>(max_chunk_size))
+      : mtu;
+  const int delay_floor_ms = (std::max)(0, chunk_delay_ms);
+  const int bps = (std::max)(0, bytes_per_second);
 
-  std::thread([this, data, without_response, shared_result, char_copy, chunk_size]() {
+  std::thread([this, data, without_response, shared_result, char_copy, chunk_size,
+               delay_floor_ms, bps]() {
     try {
       auto write_option = without_response
           ? GattWriteOption::WriteWithoutResponse
           : GattWriteOption::WriteWithResponse;
 
-      // The Dart side hands the whole print job to this single call; chunk it
-      // by the negotiated MTU and send sequentially so concurrent jobs cannot
-      // interleave (issue #21).
       for (size_t offset = 0; offset < data.size(); offset += chunk_size) {
         const size_t len = (std::min)(chunk_size, data.size() - offset);
 
@@ -490,6 +495,19 @@ void BleManager::Write(
             shared_result->Error("WRITE_FAILED", "GATT write failed");
           });
           return;
+        }
+
+        if (offset + len < data.size()) {
+          long long throughput_ms = 0;
+          if (bps > 0 && len > 0) {
+            throughput_ms =
+                (static_cast<long long>(len) * 1000 + bps - 1) / bps;
+          }
+          const long long delay_ms =
+              (std::max)(static_cast<long long>(delay_floor_ms), throughput_ms);
+          if (delay_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+          }
         }
       }
 

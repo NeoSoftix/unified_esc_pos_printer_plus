@@ -197,7 +197,9 @@ void UnifiedEscPosPrinterPlugin::HandleMethodCall(
         }
       }
     }
-    ble_manager_->Write(data, get_bool("withoutResponse", false), std::move(result));
+    ble_manager_->Write(data, get_bool("withoutResponse", false),
+                        get_int("chunkSize", 0), get_int("chunkDelayMs", 0),
+                        get_int("bytesPerSecond", 0), std::move(result));
   } else if (method == "bleDisconnect") {
     ble_manager_->Disconnect(std::move(result));
   }

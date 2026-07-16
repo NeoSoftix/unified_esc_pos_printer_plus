@@ -121,7 +121,12 @@ class UnifiedEscPosPrinterPlugin : FlutterPlugin, MethodCallHandler, ActivityAwa
             "bleWrite" -> {
                 val data = call.argument<ByteArray>("data")!!
                 val withoutResponse = call.argument<Boolean>("withoutResponse") ?: false
-                bleManager.write(data, withoutResponse, result)
+                val chunkSize = call.argument<Int>("chunkSize") ?: 0
+                val chunkDelayMs = call.argument<Int>("chunkDelayMs") ?: 0
+                val bytesPerSecond = call.argument<Int>("bytesPerSecond") ?: 0
+                bleManager.write(
+                    data, withoutResponse, chunkSize, chunkDelayMs, bytesPerSecond, result
+                )
             }
             "bleDisconnect" -> bleManager.disconnect(result)
 

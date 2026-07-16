@@ -84,7 +84,17 @@ public class UnifiedEscPosPrinterPlugin: NSObject, FlutterPlugin {
         case "bleWrite":
             let data = (args?["data"] as? FlutterStandardTypedData)?.data ?? Data()
             let withoutResponse = args?["withoutResponse"] as? Bool ?? false
-            bleManager?.write(data: data, withoutResponse: withoutResponse, result: result)
+            let chunkSize = args?["chunkSize"] as? Int ?? 0
+            let chunkDelayMs = args?["chunkDelayMs"] as? Int ?? 0
+            let bytesPerSecond = args?["bytesPerSecond"] as? Int ?? 0
+            bleManager?.write(
+                data: data,
+                withoutResponse: withoutResponse,
+                maxChunkSize: chunkSize,
+                chunkDelayMs: chunkDelayMs,
+                bytesPerSecond: bytesPerSecond,
+                result: result
+            )
         case "bleDisconnect":
             bleManager?.disconnect(result: result)
 

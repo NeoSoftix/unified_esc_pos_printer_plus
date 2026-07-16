@@ -21,24 +21,34 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     private var targetServiceUUID: CBUUID?
     private var targetCharUUID: CBUUID?
 
-    // One write call = one print job. Jobs are chunked by the MTU and run
-    // one at a time so concurrent jobs cannot interleave (issue #21).
+    // One write call = one print job (chunked + paced; issue #21).
     private class WriteJob {
         let chunks: [Data]
         let withoutResponse: Bool
+        let chunkDelayMs: Int
+        let bytesPerSecond: Int
         let result: FlutterResult
         var index = 0
         var awaitingAck = false
 
-        init(chunks: [Data], withoutResponse: Bool, result: @escaping FlutterResult) {
+        init(
+            chunks: [Data],
+            withoutResponse: Bool,
+            chunkDelayMs: Int,
+            bytesPerSecond: Int,
+            result: @escaping FlutterResult
+        ) {
             self.chunks = chunks
             self.withoutResponse = withoutResponse
+            self.chunkDelayMs = chunkDelayMs
+            self.bytesPerSecond = bytesPerSecond
             self.result = result
         }
     }
 
     private var writeJobs: [WriteJob] = []
     private var activeJob: WriteJob?
+    private var chunkDelayWorkItem: DispatchWorkItem?
 
     var connectionStateCallback: ((String) -> Void)?
 
@@ -181,15 +191,21 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         result(canWriteWithoutResponse)
     }
 
-    func write(data: Data, withoutResponse: Bool, result: @escaping FlutterResult) {
+    func write(
+        data: Data,
+        withoutResponse: Bool,
+        maxChunkSize: Int,
+        chunkDelayMs: Int,
+        bytesPerSecond: Int,
+        result: @escaping FlutterResult
+    ) {
         guard connectedPeripheral != nil, txCharacteristic != nil else {
             result(FlutterError(code: "NOT_CONNECTED", message: "BLE device not connected", details: nil))
             return
         }
 
-        // The Dart side hands the whole print job to this single call; chunk
-        // it by the MTU and send sequentially via the job queue.
-        let chunkSize = max(20, mtuPayload)
+        let mtu = max(20, mtuPayload)
+        let chunkSize = maxChunkSize > 0 ? min(mtu, maxChunkSize) : mtu
         var chunks: [Data] = []
         var offset = 0
         while offset < data.count {
@@ -203,7 +219,13 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             return
         }
 
-        writeJobs.append(WriteJob(chunks: chunks, withoutResponse: withoutResponse, result: result))
+        writeJobs.append(WriteJob(
+            chunks: chunks,
+            withoutResponse: withoutResponse,
+            chunkDelayMs: max(0, chunkDelayMs),
+            bytesPerSecond: max(0, bytesPerSecond),
+            result: result
+        ))
         pumpWriteJobs()
     }
 
@@ -213,8 +235,17 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         sendChunks()
     }
 
-    // Send chunks of the active job until it completes, backpressure kicks
-    // in (write-without-response), or an ACK is pending (write-with-response).
+    private func pacedDelayMs(job: WriteJob, chunkLength: Int) -> Int {
+        let floor = max(0, job.chunkDelayMs)
+        let throughput: Int
+        if job.bytesPerSecond > 0 && chunkLength > 0 {
+            throughput = (chunkLength * 1000 + job.bytesPerSecond - 1) / job.bytesPerSecond
+        } else {
+            throughput = 0
+        }
+        return max(floor, throughput)
+    }
+
     private func sendChunks() {
         guard let job = activeJob, !job.awaitingAck else { return }
         guard let peripheral = connectedPeripheral, let char = txCharacteristic else {
@@ -233,6 +264,13 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                 if !peripheral.canSendWriteWithoutResponse { return }
                 peripheral.writeValue(chunk, for: char, type: .withoutResponse)
                 job.index += 1
+                if job.index < job.chunks.count {
+                    let delay = pacedDelayMs(job: job, chunkLength: chunk.count)
+                    if delay > 0 {
+                        scheduleChunkDelay(delayMs: delay)
+                        return
+                    }
+                }
             } else {
                 job.awaitingAck = true
                 peripheral.writeValue(chunk, for: char, type: .withResponse)
@@ -246,7 +284,19 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         pumpWriteJobs()
     }
 
+    private func scheduleChunkDelay(delayMs: Int) {
+        chunkDelayWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.chunkDelayWorkItem = nil
+            self?.sendChunks()
+        }
+        chunkDelayWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs), execute: work)
+    }
+
     private func failAllJobs(code: String, message: String) {
+        chunkDelayWorkItem?.cancel()
+        chunkDelayWorkItem = nil
         if let job = activeJob {
             activeJob = nil
             job.result(FlutterError(code: code, message: message, details: nil))
@@ -394,12 +444,22 @@ class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         job.awaitingAck = false
 
         if let error = error {
+            chunkDelayWorkItem?.cancel()
+            chunkDelayWorkItem = nil
             activeJob = nil
             job.result(FlutterError(code: "WRITE_FAILED", message: error.localizedDescription, details: nil))
             pumpWriteJobs()
             return
         }
 
+        if job.index < job.chunks.count {
+            let written = job.chunks[job.index - 1].count
+            let delay = pacedDelayMs(job: job, chunkLength: written)
+            if delay > 0 {
+                scheduleChunkDelay(delayMs: delay)
+                return
+            }
+        }
         sendChunks()
     }
 

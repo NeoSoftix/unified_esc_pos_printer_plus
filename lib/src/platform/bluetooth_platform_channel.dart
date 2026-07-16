@@ -85,14 +85,20 @@ class BluetoothPlatformChannel {
         false;
   }
 
-  /// Write a single chunk of data to the connected BLE characteristic.
+  /// Write [data] to the connected BLE characteristic.
   Future<void> bleWrite({
     required Uint8List data,
     required bool withoutResponse,
+    int chunkSize = kDefaultBleChunkSize,
+    int chunkDelayMs = kDefaultBleChunkDelayMs,
+    int bytesPerSecond = kDefaultBleBytesPerSecond,
   }) async {
     await _method.invokeMethod('bleWrite', {
       'data': data,
       'withoutResponse': withoutResponse,
+      'chunkSize': chunkSize,
+      'chunkDelayMs': chunkDelayMs,
+      'bytesPerSecond': bytesPerSecond,
     });
   }
 

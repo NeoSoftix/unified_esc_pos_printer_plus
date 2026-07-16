@@ -48,11 +48,12 @@ class BleManager(private val context: Context) {
 
         private val instances = CopyOnWriteArrayList<BleManager>()
 
-        // One write call = one print job. Jobs are chunked by the negotiated
-        // MTU and run one at a time so concurrent jobs cannot interleave.
+        // One write call = one print job (chunked + paced; issue #21).
         private class WriteJob(
             val chunks: List<ByteArray>,
             val withoutResponse: Boolean,
+            val chunkDelayMs: Int,
+            val bytesPerSecond: Int,
             val result: MethodChannel.Result
         ) {
             var index = 0
@@ -60,6 +61,7 @@ class BleManager(private val context: Context) {
 
         private val jobQueue = ArrayDeque<WriteJob>()
         private var activeJob: WriteJob? = null
+        private val chunkDelayRunnable = Runnable { writeNextChunk() }
 
         private fun broadcastState(state: String) {
             for (instance in instances) {
@@ -85,6 +87,7 @@ class BleManager(private val context: Context) {
 
         // Tear down the shared connection. Main thread only.
         private fun cleanupConnection() {
+            sharedMainHandler.removeCallbacks(chunkDelayRunnable)
             failAllJobs("DISCONNECTED", "BLE device disconnected")
             try {
                 gatt?.disconnect()
@@ -98,6 +101,108 @@ class BleManager(private val context: Context) {
             negotiatedMtu = 20
             writeWithoutResponse = false
             leaseHolders.clear()
+        }
+
+        // Main thread only.
+        private fun pumpJobs() {
+            if (activeJob != null) return
+            activeJob = jobQueue.poll() ?: return
+            writeNextChunk()
+        }
+
+        // Main thread only.
+        private fun writeNextChunk() {
+            val job = activeJob ?: return
+
+            if (job.index >= job.chunks.size) {
+                activeJob = null
+                job.result.success(null)
+                pumpJobs()
+                return
+            }
+
+            val g = gatt
+            val char = txCharacteristic
+            if (g == null || char == null) {
+                activeJob = null
+                job.result.error("NOT_CONNECTED", "BLE device not connected", null)
+                pumpJobs()
+                return
+            }
+
+            val chunk = job.chunks[job.index]
+
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    // Android 13+ uses new writeCharacteristic API
+                    val writeType = if (job.withoutResponse)
+                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                    else
+                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+
+                    val status = g.writeCharacteristic(char, chunk, writeType)
+                    if (status != BluetoothStatusCodes.SUCCESS) {
+                        activeJob = null
+                        job.result.error("WRITE_FAILED", "writeCharacteristic returned $status", null)
+                        pumpJobs()
+                    }
+                } else {
+                    @Suppress("DEPRECATION")
+                    char.writeType = if (job.withoutResponse)
+                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                    else
+                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+
+                    @Suppress("DEPRECATION")
+                    char.value = chunk
+
+                    @Suppress("DEPRECATION")
+                    val success = g.writeCharacteristic(char)
+                    if (!success) {
+                        activeJob = null
+                        job.result.error("WRITE_FAILED", "writeCharacteristic returned false", null)
+                        pumpJobs()
+                    }
+                }
+            } catch (e: SecurityException) {
+                activeJob = null
+                job.result.error("PERMISSION_DENIED", "Bluetooth write permission denied", e.message)
+                pumpJobs()
+            }
+        }
+
+        private fun pacedDelayMs(job: WriteJob, chunkLength: Int): Long {
+            val floor = job.chunkDelayMs.toLong().coerceAtLeast(0L)
+            val throughput = if (job.bytesPerSecond > 0 && chunkLength > 0) {
+                (chunkLength * 1000L + job.bytesPerSecond - 1) / job.bytesPerSecond
+            } else {
+                0L
+            }
+            return maxOf(floor, throughput)
+        }
+
+        // Main thread only. Called from onCharacteristicWrite for each chunk.
+        private fun onChunkAck(status: Int) {
+            val job = activeJob ?: return
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                val written = job.chunks[job.index].size
+                job.index++
+                if (job.index < job.chunks.size) {
+                    val delay = pacedDelayMs(job, written)
+                    if (delay > 0) {
+                        sharedMainHandler.postDelayed(chunkDelayRunnable, delay)
+                    } else {
+                        writeNextChunk()
+                    }
+                } else {
+                    writeNextChunk()
+                }
+            } else {
+                sharedMainHandler.removeCallbacks(chunkDelayRunnable)
+                activeJob = null
+                job.result.error("WRITE_FAILED", "BLE write failed with status $status", null)
+                pumpJobs()
+            }
         }
     }
 
@@ -420,7 +525,7 @@ class BleManager(private val context: Context) {
                 characteristic: BluetoothGattCharacteristic,
                 status: Int
             ) {
-                sharedMainHandler.post { onChunkAck(status) }
+                sharedMainHandler.post { Companion.onChunkAck(status) }
             }
         }
 
@@ -453,13 +558,21 @@ class BleManager(private val context: Context) {
         result.success(writeWithoutResponse)
     }
 
-    fun write(data: ByteArray, withoutResponse: Boolean, result: MethodChannel.Result) {
+    fun write(
+        data: ByteArray,
+        withoutResponse: Boolean,
+        maxChunkSize: Int,
+        chunkDelayMs: Int,
+        bytesPerSecond: Int,
+        result: MethodChannel.Result
+    ) {
         if (gatt == null || txCharacteristic == null) {
             result.error("NOT_CONNECTED", "BLE device not connected", null)
             return
         }
 
-        val chunkSize = if (negotiatedMtu > 0) negotiatedMtu else 20
+        val mtu = if (negotiatedMtu > 0) negotiatedMtu else 20
+        val chunkSize = if (maxChunkSize > 0) minOf(mtu, maxChunkSize) else mtu
         val chunks = mutableListOf<ByteArray>()
         var offset = 0
         while (offset < data.size) {
@@ -473,89 +586,16 @@ class BleManager(private val context: Context) {
             return
         }
 
-        jobQueue.add(WriteJob(chunks, withoutResponse, result))
+        jobQueue.add(
+            WriteJob(
+                chunks,
+                withoutResponse,
+                chunkDelayMs.coerceAtLeast(0),
+                bytesPerSecond.coerceAtLeast(0),
+                result
+            )
+        )
         pumpJobs()
-    }
-
-    // Main thread only.
-    private fun pumpJobs() {
-        if (activeJob != null) return
-        activeJob = jobQueue.poll() ?: return
-        writeNextChunk()
-    }
-
-    // Main thread only.
-    private fun writeNextChunk() {
-        val job = activeJob ?: return
-
-        if (job.index >= job.chunks.size) {
-            activeJob = null
-            job.result.success(null)
-            pumpJobs()
-            return
-        }
-
-        val g = gatt
-        val char = txCharacteristic
-        if (g == null || char == null) {
-            activeJob = null
-            job.result.error("NOT_CONNECTED", "BLE device not connected", null)
-            pumpJobs()
-            return
-        }
-
-        val chunk = job.chunks[job.index]
-
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                // Android 13+ uses new writeCharacteristic API
-                val writeType = if (job.withoutResponse)
-                    BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                else
-                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-
-                val status = g.writeCharacteristic(char, chunk, writeType)
-                if (status != BluetoothStatusCodes.SUCCESS) {
-                    activeJob = null
-                    job.result.error("WRITE_FAILED", "writeCharacteristic returned $status", null)
-                    pumpJobs()
-                }
-            } else {
-                @Suppress("DEPRECATION")
-                char.writeType = if (job.withoutResponse)
-                    BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                else
-                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-
-                @Suppress("DEPRECATION")
-                char.value = chunk
-
-                @Suppress("DEPRECATION")
-                val success = g.writeCharacteristic(char)
-                if (!success) {
-                    activeJob = null
-                    job.result.error("WRITE_FAILED", "writeCharacteristic returned false", null)
-                    pumpJobs()
-                }
-            }
-        } catch (e: SecurityException) {
-            activeJob = null
-            job.result.error("PERMISSION_DENIED", "Bluetooth write permission denied", e.message)
-            pumpJobs()
-        }
-    }
-
-    // Main thread only. Called from onCharacteristicWrite for each chunk.
-    private fun onChunkAck(status: Int) {
-        val job = activeJob ?: return
-        if (status == BluetoothGatt.GATT_SUCCESS) {
-            job.index++
-            writeNextChunk()
-        } else {
-            activeJob = null
-            job.result.error("WRITE_FAILED", "BLE write failed with status $status", null)
-            pumpJobs()
-        }
     }
 
     fun disconnect(result: MethodChannel.Result) {

@@ -38,6 +38,7 @@ A unified ESC/POS thermal printer package for Flutter. Supports USB, Bluetooth C
 > throws `PrinterConnectionException`.
 
 > **Android USB notes:**
+>
 > - The Android device must support **USB OTG** (host mode). Most modern phones and tablets do.
 > - The connector picks the right transport automatically based on the printer's USB interface class:
 >   - **CDC / Virtual COM** chips (FTDI, CP210x, PL2303, CH34x, USB CDC ACM) go through the `usb_serial` package.
@@ -97,7 +98,7 @@ Add only the permissions for the connection types you use:
 <uses-feature android:name="android.hardware.usb.host" android:required="false" />
 ```
 
-> **Note on `neverForLocation`:** the `BLUETOOTH_SCAN` declaration above uses `usesPermissionFlags="neverForLocation"` to tell Android that your app does not derive physical location from BLE scan results. Remove this flag if your app *does* use BLE scans to infer location — in that case you must also request `ACCESS_FINE_LOCATION` at runtime on API 31+.
+> **Note on `neverForLocation`:** the `BLUETOOTH_SCAN` declaration above uses `usesPermissionFlags="neverForLocation"` to tell Android that your app does not derive physical location from BLE scan results. Remove this flag if your app _does_ use BLE scans to infer location — in that case you must also request `ACCESS_FINE_LOCATION` at runtime on API 31+.
 
 ### iOS Setup
 
@@ -450,6 +451,39 @@ final manager = PrinterManager(
 );
 ```
 
+### BLE Write Pacing
+
+BLE printers often forward data to the print MCU over a small internal UART
+**without flow control**. A GATT write ACK only means the radio accepted the
+packet — not that the printer has drained it. Pushing a large ticket too fast
+(especially multilingual `textRaster` bitmaps) overflows that buffer and
+shows up as garbled / weird characters. Classic Bluetooth is usually less
+sensitive because RFCOMM buffers better.
+
+`BleConnector` paces writes by default:
+
+| Parameter        | Default    | Meaning                                          |
+| ---------------- | ---------- | ------------------------------------------------ |
+| `chunkSize`      | `128`      | Bytes per GATT write (`0` = full negotiated MTU) |
+| `bytesPerSecond` | `6 * 1024` | Target throughput used to delay between chunks   |
+
+These defaults are a practical middle ground for common cheap ESC/POS BLE
+modules. They are **not guaranteed for every printer** — models differ. If
+output still garbles (often only on large / full tickets), slow the transfer:
+
+```dart
+final manager = PrinterManager(
+  bleConnector: BleConnector(
+    chunkSize: 64,
+    bytesPerSecond: 4 * 1024, // lower = safer, slower
+  ),
+);
+```
+
+If a printer handles faster transfers cleanly, you can raise
+`bytesPerSecond` (e.g. `8 * 1024`). Tune per device: increase until output
+garbles, then step back.
+
 ### Concurrent Print Jobs
 
 Print jobs cannot interrupt each other:
@@ -463,7 +497,7 @@ Print jobs cannot interrupt each other:
   notification handler while the main app prints too), the Bluetooth
   Classic, BLE, and USB printer-class connections are shared process-wide.
   A second isolate connecting to the same printer reuses the live connection
-  and its job queues behind the one in progress. Connecting to a *different*
+  and its job queues behind the one in progress. Connecting to a _different_
   printer while another isolate holds the connection throws a
   `PrinterConnectionException` with a printer-busy message; retry after the
   other job finishes.
