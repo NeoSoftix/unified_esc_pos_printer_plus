@@ -96,7 +96,7 @@ Add only the permissions for the connection types you use:
 
 ### iOS Setup
 
-This plugin supports both **CocoaPods** (default) and **Swift Package Manager** (Flutter ≥ 3.22). To use SPM, add `ENV['SWIFT_PACKAGE_MANAGER'] = 'true'` to your `ios/Podfile` before running `pod install`.
+This plugin supports both **CocoaPods** and **Swift Package Manager**. No setup is needed for either: Flutter 3.44+ uses SPM by default, and older versions fall back to CocoaPods automatically. To opt in to SPM on an earlier Flutter version, run `flutter config --enable-swift-package-manager`.
 
 Add to `ios/Runner/Info.plist`:
 
