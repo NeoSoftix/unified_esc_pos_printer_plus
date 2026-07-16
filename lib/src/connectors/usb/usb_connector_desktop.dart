@@ -7,6 +7,7 @@ import '../../core/commands.dart';
 import '../../exceptions/printer_exception.dart';
 import '../../models/printer_connection_state.dart';
 import '../../models/printer_device.dart';
+import '../../utils/drain_estimator.dart';
 import 'usb_connector_interface.dart';
 
 /// USB connector for desktop platforms (Windows, Linux, macOS) using
@@ -17,6 +18,13 @@ import 'usb_connector_interface.dart';
 class UsbConnectorImpl extends UsbConnectorBase {
   SerialPort? _port;
   SerialPortReader? _reader;
+
+  // Writes only reach the OS buffer; wire rate at 8N1 is baud / 10 bytes/s.
+  final DrainEstimator _drain = DrainEstimator(
+    bytesPerSecond: kDefaultBaudRate ~/ 10,
+    assumedBufferBytes: kDrainBufferBytes,
+    maxWait: const Duration(milliseconds: kMaxDrainWaitMs),
+  );
 
   PrinterConnectionState _state = PrinterConnectionState.disconnected;
   final StreamController<PrinterConnectionState> _stateController =
@@ -112,10 +120,15 @@ class UsbConnectorImpl extends UsbConnectorBase {
   Future<void> writeBytes(List<int> bytes) async {
     _assertState(PrinterConnectionState.connected, 'writeBytes');
     _setState(PrinterConnectionState.printing);
+
+    final DateTime writeStart = DateTime.now();
+
     try {
       _port!.write(Uint8List.fromList(bytes));
+      _drain.onWrite(bytes.length, writeStart, DateTime.now());
       _setState(PrinterConnectionState.connected);
     } catch (e) {
+      _drain.reset();
       _setState(PrinterConnectionState.error);
       _setState(PrinterConnectionState.disconnected);
       throw PrinterWriteException('USB serial write failed', cause: e);
@@ -123,8 +136,17 @@ class UsbConnectorImpl extends UsbConnectorBase {
   }
 
   @override
+  Future<void> waitWriteComplete() => _drain.wait();
+
+  @override
   Future<void> disconnect() async {
     if (_state == PrinterConnectionState.disconnected) return;
+
+    // Closing the port discards data still queued in the OS buffer.
+    if (_state == PrinterConnectionState.connected) {
+      await waitWriteComplete();
+    }
+
     _setState(PrinterConnectionState.disconnecting);
     try {
       _reader?.close();
@@ -133,6 +155,7 @@ class UsbConnectorImpl extends UsbConnectorBase {
       _port?.dispose();
       _reader = null;
       _port = null;
+      _drain.reset();
       _setState(PrinterConnectionState.disconnected);
     }
   }

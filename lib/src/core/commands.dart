@@ -137,3 +137,15 @@ const int kScanSubnetTimeoutMs = 500;
 
 /// Default chunk size for Bluetooth Classic writes (bytes)
 const int kDefaultBtChunkSize = 512;
+
+/// Conservative Bluetooth Classic (SPP) throughput for drain estimation (bytes/second)
+const int kBtDrainBytesPerSecond = 8 * 1024;
+
+/// Assumed size of the local OS/stack write buffer (bytes)
+const int kDrainBufferBytes = 16 * 1024;
+
+/// Upper bound on any single drain wait (milliseconds)
+const int kMaxDrainWaitMs = 10000;
+
+/// Drain delay after BLE write-without-response data (milliseconds)
+const int kBleWwrDrainDelayMs = 500;

@@ -409,6 +409,40 @@ if (manager.isConnected) { ... }
 final device = manager.connectedDevice;
 ```
 
+### Waiting for Writes to Complete
+
+On some transports (Bluetooth Classic, BLE write-without-response, USB
+serial), `printTicket()` resolves once the data is accepted by an OS buffer,
+not when it has physically reached the printer. `disconnect()` automatically
+waits for that buffer to drain, so printing followed immediately by a
+disconnect does not truncate the job:
+
+```dart
+await manager.printTicket(ticket);
+await manager.disconnect(); // waits for buffered data to drain first
+```
+
+When you need the barrier without disconnecting (e.g. printing several
+tickets and reporting completion between them), use `waitWriteComplete()`:
+
+```dart
+await manager.printTicket(ticket);
+await manager.waitWriteComplete(); // resolves when the data has had time to reach the printer
+```
+
+The drain time is estimated from the amount of data written and a
+conservative link throughput. For Bluetooth Classic you can tune it via the
+connector:
+
+```dart
+final manager = PrinterManager(
+  bluetoothConnector: BluetoothConnector(
+    drainBytesPerSecond: 16 * 1024,              // your printer's real throughput
+    maxDrainWait: const Duration(seconds: 5),     // cap on any single wait
+  ),
+);
+```
+
 ### Error Handling
 
 The package provides a typed exception hierarchy:
