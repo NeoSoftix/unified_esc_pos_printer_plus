@@ -61,6 +61,9 @@ class UsbConnector extends PrinterConnector<UsbPrinterDevice> {
   Future<void> writeBytes(List<int> bytes) => _impl.writeBytes(bytes);
 
   @override
+  Future<void> waitWriteComplete() => _impl.waitWriteComplete();
+
+  @override
   Future<void> disconnect() => _impl.disconnect();
 
   @override
