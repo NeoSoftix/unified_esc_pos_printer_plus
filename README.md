@@ -25,12 +25,17 @@ A unified ESC/POS thermal printer package for Flutter. Supports USB, Bluetooth C
 
 ## Platform Support
 
-| Connection        | Android   | iOS | Windows             | Linux        | macOS        |
-| ----------------- | --------- | --- | ------------------- | ------------ | ------------ |
-| Network (TCP/IP)  | Yes       | Yes | Yes                 | Yes          | Yes          |
-| Bluetooth Classic | Yes       | —   | Yes                 | —            | —            |
-| BLE               | Yes       | Yes | Yes                 | —            | —            |
-| USB               | Yes (OTG) | —   | Yes (Print Spooler) | Yes (serial) | Yes (serial) |
+| Connection        | Android   | iOS | Windows             | Linux        | macOS        | Web |
+| ----------------- | --------- | --- | ------------------- | ------------ | ------------ | --- |
+| Network (TCP/IP)  | Yes       | Yes | Yes                 | Yes          | Yes          | No  |
+| Bluetooth Classic | Yes       | No  | Yes                 | No           | No           | No  |
+| BLE               | Yes       | Yes | Yes                 | No           | No           | No  |
+| USB               | Yes (OTG) | No  | Yes (Print Spooler) | Yes (serial) | Yes (serial) | No  |
+
+> **Web:** the package compiles on web so multi-platform apps can share code,
+> but browsers expose no raw TCP, SPP, or USB access, so no connection type
+> is functional there. `scanPrinters()` finds no devices and `connect()`
+> throws `PrinterConnectionException`.
 
 > **Android USB notes:**
 > - The Android device must support **USB OTG** (host mode). Most modern phones and tablets do.

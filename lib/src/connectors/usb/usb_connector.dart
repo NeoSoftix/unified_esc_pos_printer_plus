@@ -1,16 +1,17 @@
-import 'dart:io';
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform, kIsWeb;
 
 import '../../models/printer_connection_state.dart';
 import '../../models/printer_device.dart';
 import '../printer_connector.dart';
-import 'usb_connector_android.dart'
-    if (dart.library.html) 'usb_connector_stub.dart' as android_impl;
-import 'usb_connector_desktop.dart'
-    if (dart.library.html) 'usb_connector_stub.dart' as desktop_impl;
+import 'usb_connector_stub.dart'
+    if (dart.library.io) 'usb_connector_android.dart' as android_impl;
+import 'usb_connector_stub.dart'
+    if (dart.library.io) 'usb_connector_desktop.dart' as desktop_impl;
 import 'usb_connector_interface.dart';
 import 'usb_connector_stub.dart' as stub_impl;
-import 'usb_connector_windows.dart'
-    if (dart.library.html) 'usb_connector_stub.dart' as windows_impl;
+import 'usb_connector_stub.dart'
+    if (dart.library.io) 'usb_connector_windows.dart' as windows_impl;
 
 /// Platform-routing USB connector.
 ///
@@ -25,12 +26,15 @@ class UsbConnector extends PrinterConnector<UsbPrinterDevice> {
   final UsbConnectorBase _impl;
 
   static UsbConnectorBase _createImpl() {
-    if (Platform.isAndroid) return android_impl.UsbConnectorImpl();
-    if (Platform.isWindows) return windows_impl.UsbConnectorImpl();
-    if (Platform.isLinux || Platform.isMacOS) {
-      return desktop_impl.UsbConnectorImpl();
-    }
-    return stub_impl.UsbConnectorImpl();
+    if (kIsWeb) return stub_impl.UsbConnectorImpl();
+    return switch (defaultTargetPlatform) {
+      TargetPlatform.android => android_impl.UsbConnectorImpl(),
+      TargetPlatform.windows => windows_impl.UsbConnectorImpl(),
+      TargetPlatform.linux ||
+      TargetPlatform.macOS =>
+        desktop_impl.UsbConnectorImpl(),
+      _ => stub_impl.UsbConnectorImpl(),
+    };
   }
 
   @override

@@ -1,6 +1,8 @@
 import 'dart:async';
-import 'dart:io';
 import 'dart:typed_data' show Uint8List;
+
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform, kIsWeb;
 
 import '../core/commands.dart';
 import '../exceptions/printer_exception.dart';
@@ -48,6 +50,11 @@ class BluetoothConnector extends PrinterConnector<BluetoothPrinterDevice> {
   final BluetoothPlatformChannel _platform = BluetoothPlatformChannel.instance;
   StreamSubscription<Map<String, dynamic>>? _connectionSub;
 
+  static bool get _isSupportedPlatform =>
+      !kIsWeb &&
+      (defaultTargetPlatform == TargetPlatform.android ||
+          defaultTargetPlatform == TargetPlatform.windows);
+
   PrinterConnectionState _state = PrinterConnectionState.disconnected;
   final StreamController<PrinterConnectionState> _stateController =
       StreamController<PrinterConnectionState>.broadcast();
@@ -64,7 +71,7 @@ class BluetoothConnector extends PrinterConnector<BluetoothPrinterDevice> {
   }) async* {
     _setState(PrinterConnectionState.scanning);
 
-    if (!Platform.isAndroid && !Platform.isWindows) {
+    if (!_isSupportedPlatform) {
       _setState(PrinterConnectionState.error);
       _setState(PrinterConnectionState.disconnected);
       throw const PrinterConnectionException(
@@ -152,7 +159,7 @@ class BluetoothConnector extends PrinterConnector<BluetoothPrinterDevice> {
 
   @override
   Future<void> stopScan() async {
-    if (!Platform.isAndroid && !Platform.isWindows) return;
+    if (!_isSupportedPlatform) return;
 
     try {
       await _platform.stopBtDiscovery();
@@ -173,7 +180,7 @@ class BluetoothConnector extends PrinterConnector<BluetoothPrinterDevice> {
     _assertState(PrinterConnectionState.disconnected, 'connect');
     _setState(PrinterConnectionState.connecting);
 
-    if (!Platform.isAndroid && !Platform.isWindows) {
+    if (!_isSupportedPlatform) {
       _setState(PrinterConnectionState.error);
       _setState(PrinterConnectionState.disconnected);
       throw const PrinterConnectionException(

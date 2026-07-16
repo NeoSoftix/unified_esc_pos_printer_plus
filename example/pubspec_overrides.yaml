@@ -1,0 +1,5 @@
+# Local development only; see the note in the package root
+# pubspec_overrides.yaml. libserialport_plus 1.0.x build hooks currently
+# fail on Windows when the project path contains spaces.
+dependency_overrides:
+  libserialport_plus: 0.1.2

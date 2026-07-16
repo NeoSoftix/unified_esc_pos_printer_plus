@@ -18,11 +18,14 @@ dependencies:
   # USB — Android OTG
   usb_serial: ^0.5.2
 
-  # USB — Windows / Linux / macOS serial port (wraps libserialport)
-  libserialport_plus: ^0.1.1
+  # USB — Windows / Linux / macOS serial port (wraps libserialport).
+  # Wide range: the API this package uses is compatible with both 0.1.x
+  # (Flutter FFI plugin) and 1.x (Dart FFI package with build hooks, needs
+  # Dart >= 3.10). Pub resolves the newest one the consumer's SDK supports.
+  libserialport_plus: ">=0.1.1 <2.0.0"
 
   # Network discovery — get device local IP for subnet scanning
-  network_info_plus: ^7.0.0
+  network_info_plus: ">=7.0.0 <9.0.0"
 
 dev_dependencies:
   flutter_test:
@@ -49,6 +52,7 @@ platforms:
   macos:
   windows:
   linux:
+  web:
 
 topics:
   - esc-pos
