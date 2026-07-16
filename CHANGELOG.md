@@ -2,6 +2,7 @@
 
 - Fix truncated prints when `disconnect()` is called right after `printTicket()` ([#17](https://github.com/elrizwiraswara/unified_esc_pos_printer/issues/17)). On Bluetooth Classic, BLE write-without-response, and USB serial, a completed write only means the data reached an OS/stack buffer; closing the link immediately discarded whatever was still queued. `disconnect()` now waits for that buffer to drain before tearing the connection down, so no caller-side delay is needed anymore.
 - Add `PrinterManager.waitWriteComplete()` (also available on every connector) for an explicit write barrier without disconnecting. The drain time is estimated from the amount of data written and a conservative link throughput; when a write was flow-controlled, the real throughput is measured from the write duration instead. Tunable per connector via `BluetoothConnector(drainBytesPerSecond:, maxDrainWait:)` and `BleConnector(writeWithoutResponseDrainDelay:)`.
+- Add Swift Package Manager (SPM) support for iOS. The plugin now ships with a `Package.swift` manifest alongside the existing CocoaPods podspec. SPM is used automatically on Flutter 3.44+ (or opt in earlier via `flutter config --enable-swift-package-manager`); CocoaPods continues to work unchanged. No source code changes, the same Swift files are shared between both systems.
 
 ## 3.3.3
 
