@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import '../core/commands.dart';
 import '../exceptions/printer_exception.dart';
 import '../models/printer_connection_state.dart';
 import '../models/printer_device.dart';
@@ -9,22 +10,41 @@ import 'printer_connector.dart';
 
 /// Connector for BLE (Bluetooth Low Energy) ESC/POS printers.
 ///
-/// **Discovery:** Uses native BLE scanning to find nearby BLE devices.
+/// **Discovery:** Native BLE scan.
 ///
-/// **Connection:** Discovers services, then auto-locates a writable
-/// characteristic. Tries the well-known ESC/POS BLE service UUID first;
-/// falls back to any writable characteristic found.
+/// **Connection:** Finds a writable characteristic (ESC/POS UUID first, then
+/// any writable). Sends `ESC @` on connect. Throws
+/// [PrinterPermissionException] if Bluetooth permission is denied.
 ///
-/// **Writing:** Negotiates MTU 512 after connecting and chunks data into
-/// MTU-sized write operations.
-///
-/// **Permissions:** Automatically requests Bluetooth permissions when
-/// scanning or connecting. Throws [PrinterPermissionException] if denied.
+/// **Writing:** Paces [chunkSize] slices at ~[bytesPerSecond] to avoid
+/// overflowing slow printer modules. Drains write-without-response data
+/// before [disconnect].
 class BleConnector extends PrinterConnector<BlePrinterDevice> {
+  BleConnector({
+    this.chunkSize = kDefaultBleChunkSize,
+    this.bytesPerSecond = kDefaultBleBytesPerSecond,
+    this.interChunkDelay =
+        const Duration(milliseconds: kDefaultBleChunkDelayMs),
+    this.writeWithoutResponseDrainDelay =
+        const Duration(milliseconds: kBleWwrDrainDelayMs),
+  });
+
+  /// Bytes per GATT write. `0` uses the negotiated MTU.
+  final int chunkSize;
+
+  /// Target write throughput (bytes/second). `0` disables throughput pacing.
+  final int bytesPerSecond;
+
+  /// Minimum pause between chunks (combined with [bytesPerSecond] pacing).
+  final Duration interChunkDelay;
+
+  /// Drain delay after write-without-response data.
+  final Duration writeWithoutResponseDrainDelay;
+
   final BluetoothPlatformChannel _platform = BluetoothPlatformChannel.instance;
 
-  int _mtuPayload = 20;
   bool _writeWithoutResponse = false;
+  bool _pendingWwrDrain = false;
   StreamSubscription<Map<String, dynamic>>? _connectionSub;
 
   PrinterConnectionState _state = PrinterConnectionState.disconnected;
@@ -90,11 +110,14 @@ class BleConnector extends PrinterConnector<BlePrinterDevice> {
       (devices) {
         for (final Map<String, dynamic> d in devices) {
           final String id = d['deviceId'] as String;
-          if (!found.any((dev) => dev.deviceId == id)) {
-            found.add(BlePrinterDevice(
-              name: (d['name'] as String?) ?? id,
-              deviceId: id,
-            ));
+          final String name = (d['name'] as String?) ?? id;
+          final int existing = found.indexWhere((dev) => dev.deviceId == id);
+          if (existing == -1) {
+            found.add(BlePrinterDevice(name: name, deviceId: id));
+          } else if (name != id && found[existing].name == id) {
+            // The native side resolved a friendly name after first emitting
+            // the device with its address as a placeholder.
+            found[existing] = BlePrinterDevice(name: name, deviceId: id);
           }
         }
       },
@@ -165,21 +188,12 @@ class BleConnector extends PrinterConnector<BlePrinterDevice> {
       );
     }
 
-    // Get negotiated MTU
-    try {
-      _mtuPayload = await _platform.bleGetMtu();
-    } catch (_) {
-      _mtuPayload = 20; // safe minimum
-    }
-
-    // Check write-without-response support
     try {
       _writeWithoutResponse = await _platform.bleSupportsWriteWithoutResponse();
     } catch (_) {
       _writeWithoutResponse = false;
     }
 
-    // Monitor for remote disconnection
     _connectionSub = _platform.connectionStateStream
         .where((event) => event['type'] == 'ble')
         .listen((event) {
@@ -191,6 +205,16 @@ class BleConnector extends PrinterConnector<BlePrinterDevice> {
     });
 
     _setState(PrinterConnectionState.connected);
+
+    try {
+      await writeBytes(cInit.codeUnits);
+    } catch (e) {
+      await disconnect();
+      throw PrinterConnectionException(
+        'BLE init (ESC @) to ${device.name} failed',
+        cause: e,
+      );
+    }
   }
 
   @override
@@ -200,16 +224,42 @@ class BleConnector extends PrinterConnector<BlePrinterDevice> {
     _setState(PrinterConnectionState.printing);
 
     try {
-      for (int i = 0; i < bytes.length; i += _mtuPayload) {
-        final int end = (i + _mtuPayload).clamp(0, bytes.length);
+      final Uint8List data =
+          bytes is Uint8List ? bytes : Uint8List.fromList(bytes);
+      final int step = chunkSize > 0 ? chunkSize : 128;
+      var offset = 0;
+
+      while (offset < data.length) {
+        final int end =
+            offset + step < data.length ? offset + step : data.length;
+        final Uint8List slice = Uint8List.sublistView(data, offset, end);
+
         await _platform.bleWrite(
-          data: Uint8List.fromList(bytes.sublist(i, end)),
+          data: slice,
           withoutResponse: _writeWithoutResponse,
+          chunkSize: step,
+          chunkDelayMs: 0,
+          bytesPerSecond: 0,
         );
+
+        offset = end;
+        if (offset >= data.length) break;
+
+        final int throughputMs = bytesPerSecond > 0
+            ? (slice.length * 1000 + bytesPerSecond - 1) ~/ bytesPerSecond
+            : 0;
+        final int waitMs = throughputMs > interChunkDelay.inMilliseconds
+            ? throughputMs
+            : interChunkDelay.inMilliseconds;
+        if (waitMs > 0) {
+          await Future<void>.delayed(Duration(milliseconds: waitMs));
+        }
       }
 
+      if (_writeWithoutResponse) _pendingWwrDrain = true;
       _setState(PrinterConnectionState.connected);
     } catch (e) {
+      _pendingWwrDrain = false;
       _setState(PrinterConnectionState.error);
       _setState(PrinterConnectionState.disconnected);
       throw PrinterWriteException('BLE write failed', cause: e);
@@ -217,9 +267,22 @@ class BleConnector extends PrinterConnector<BlePrinterDevice> {
   }
 
   @override
+  Future<void> waitWriteComplete() async {
+    if (!_pendingWwrDrain) return;
+    await Future<void>.delayed(writeWithoutResponseDrainDelay);
+    _pendingWwrDrain = false;
+  }
+
+  @override
   Future<void> disconnect() async {
     if (_state == PrinterConnectionState.disconnected) return;
 
+    // Cancelling the connection drops chunks still queued in the BLE stack.
+    if (_state == PrinterConnectionState.connected) {
+      await waitWriteComplete();
+    }
+
+    _pendingWwrDrain = false;
     _setState(PrinterConnectionState.disconnecting);
 
     await _connectionSub?.cancel();

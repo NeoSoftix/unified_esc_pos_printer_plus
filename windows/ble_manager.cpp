@@ -10,6 +10,7 @@
 #include <winrt/Windows.Storage.Streams.h>
 
 #include <algorithm>
+#include <chrono>
 #include <iomanip>
 #include <sstream>
 #include <thread>
@@ -122,91 +123,30 @@ void BleManager::StartScan(
     resolved_addresses_.clear();
   }
 
-  watcher_ = BluetoothLEAdvertisementWatcher();
-  watcher_.ScanningMode(BluetoothLEScanningMode::Active);
+  try {
+    watcher_ = BluetoothLEAdvertisementWatcher();
+    watcher_.ScanningMode(BluetoothLEScanningMode::Active);
 
-  watcher_received_token_ = watcher_.Received(
-      [this](BluetoothLEAdvertisementWatcher const&,
-             BluetoothLEAdvertisementReceivedEventArgs const& args) {
-        auto address = args.BluetoothAddress();
-        std::ostringstream oss;
-        oss << std::hex << std::setfill('0');
-        oss << std::setw(2) << ((address >> 40) & 0xFF) << ":"
-            << std::setw(2) << ((address >> 32) & 0xFF) << ":"
-            << std::setw(2) << ((address >> 24) & 0xFF) << ":"
-            << std::setw(2) << ((address >> 16) & 0xFF) << ":"
-            << std::setw(2) << ((address >> 8) & 0xFF) << ":"
-            << std::setw(2) << (address & 0xFF);
-        std::string device_id = oss.str();
+    watcher_received_token_ = watcher_.Received(
+        [this](BluetoothLEAdvertisementWatcher const&,
+               BluetoothLEAdvertisementReceivedEventArgs const& args) {
+          // An exception escaping this WinRT event handler terminates the
+          // process, so nothing may throw past this boundary.
+          try {
+            OnAdvertisementReceived(args);
+          } catch (...) {}
+        });
 
-        // Try to get name from advertisement data first.
-        std::string name;
-        auto local_name = args.Advertisement().LocalName();
-        if (!local_name.empty()) {
-          name = winrt::to_string(local_name);
-        }
-
-        // If no name in advertisement, resolve via BluetoothLEDevice (once
-        // per address to avoid repeated lookups).
-        if (name.empty()) {
-          bool already_resolved = false;
-          {
-            std::lock_guard<std::mutex> lock(scan_mutex_);
-            already_resolved = resolved_addresses_.count(address) > 0;
-            resolved_addresses_.insert(address);
-          }
-          if (!already_resolved) {
-            try {
-              auto ble_device = BluetoothLEDevice::FromBluetoothAddressAsync(address).get();
-              if (ble_device != nullptr) {
-                auto friendly_name = ble_device.Name();
-                if (!friendly_name.empty()) {
-                  name = winrt::to_string(friendly_name);
-                }
-                ble_device.Close();
-              }
-            } catch (...) {
-              // Fall through — use MAC address as name.
-            }
-          }
-          if (name.empty()) {
-            name = device_id;
-          }
-        }
-
-        std::lock_guard<std::mutex> lock(scan_mutex_);
-        bool exists = std::any_of(
-            discovered_devices_.begin(), discovered_devices_.end(),
-            [&device_id](const flutter::EncodableMap& m) {
-              auto it = m.find(flutter::EncodableValue("deviceId"));
-              return it != m.end() &&
-                     std::get<std::string>(it->second) == device_id;
-            });
-
-        if (!exists) {
-          flutter::EncodableMap device_map;
-          device_map[flutter::EncodableValue("deviceId")] =
-              flutter::EncodableValue(device_id);
-          device_map[flutter::EncodableValue("name")] =
-              flutter::EncodableValue(name);
-          discovered_devices_.push_back(device_map);
-
-          if (scan_event_sink_ && dispatcher_) {
-            flutter::EncodableList list;
-            for (const auto& d : discovered_devices_) {
-              list.push_back(flutter::EncodableValue(d));
-            }
-            auto value = flutter::EncodableValue(list);
-            dispatcher_->Post([this, value = std::move(value)]() {
-              if (scan_event_sink_) {
-                scan_event_sink_->Success(value);
-              }
-            });
-          }
-        }
-      });
-
-  watcher_.Start();
+    watcher_.Start();
+  } catch (const winrt::hresult_error& e) {
+    StopScanInternal();
+    result->Error("SCAN_FAILED", winrt::to_string(e.message()));
+    return;
+  } catch (const std::exception& e) {
+    StopScanInternal();
+    result->Error("SCAN_FAILED", e.what());
+    return;
+  }
 
   // Auto-stop after timeout
   std::thread([this, timeout_ms]() {
@@ -215,6 +155,115 @@ void BleManager::StartScan(
   }).detach();
 
   result->Success(flutter::EncodableValue());
+}
+
+void BleManager::OnAdvertisementReceived(
+    BluetoothLEAdvertisementReceivedEventArgs const& args) {
+  auto address = args.BluetoothAddress();
+  std::ostringstream oss;
+  oss << std::hex << std::setfill('0');
+  oss << std::setw(2) << ((address >> 40) & 0xFF) << ":"
+      << std::setw(2) << ((address >> 32) & 0xFF) << ":"
+      << std::setw(2) << ((address >> 24) & 0xFF) << ":"
+      << std::setw(2) << ((address >> 16) & 0xFF) << ":"
+      << std::setw(2) << ((address >> 8) & 0xFF) << ":"
+      << std::setw(2) << (address & 0xFF);
+  std::string device_id = oss.str();
+
+  // Try to get name from advertisement data first. Advertisement() can be
+  // null for some advertisement types (e.g. extended advertising).
+  std::string name;
+  auto advertisement = args.Advertisement();
+  if (advertisement != nullptr) {
+    auto local_name = advertisement.LocalName();
+    if (!local_name.empty()) {
+      name = winrt::to_string(local_name);
+    }
+  }
+
+  bool needs_resolve = false;
+  if (name.empty()) {
+    std::lock_guard<std::mutex> lock(scan_mutex_);
+    needs_resolve = resolved_addresses_.count(address) == 0;
+    resolved_addresses_.insert(address);
+    name = device_id;
+  }
+
+  if (UpsertDevice(device_id, name)) {
+    EmitDeviceList();
+  }
+
+  // If the advertisement carried no name, resolve the friendly name via
+  // BluetoothLEDevice on a worker thread (once per address). Blocking with
+  // .get() inside the Received handler aborts the process when the event is
+  // delivered on an STA thread.
+  if (needs_resolve) {
+    std::thread([this, address, device_id]() {
+      try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+      } catch (...) {}
+      try {
+        auto ble_device =
+            BluetoothLEDevice::FromBluetoothAddressAsync(address).get();
+        if (ble_device != nullptr) {
+          auto friendly_name = ble_device.Name();
+          ble_device.Close();
+          if (!friendly_name.empty() &&
+              UpsertDevice(device_id, winrt::to_string(friendly_name))) {
+            EmitDeviceList();
+          }
+        }
+      } catch (...) {
+        // Keep the MAC address as the name.
+      }
+    }).detach();
+  }
+}
+
+bool BleManager::UpsertDevice(const std::string& device_id,
+                              const std::string& name) {
+  std::lock_guard<std::mutex> lock(scan_mutex_);
+
+  for (auto& m : discovered_devices_) {
+    auto it = m.find(flutter::EncodableValue("deviceId"));
+    if (it == m.end() || std::get<std::string>(it->second) != device_id) {
+      continue;
+    }
+    // Known device: only upgrade a placeholder (MAC address) name.
+    auto name_it = m.find(flutter::EncodableValue("name"));
+    if (name != device_id && name_it != m.end() &&
+        std::get<std::string>(name_it->second) == device_id) {
+      m[flutter::EncodableValue("name")] = flutter::EncodableValue(name);
+      return true;
+    }
+    return false;
+  }
+
+  flutter::EncodableMap device_map;
+  device_map[flutter::EncodableValue("deviceId")] =
+      flutter::EncodableValue(device_id);
+  device_map[flutter::EncodableValue("name")] = flutter::EncodableValue(name);
+  discovered_devices_.push_back(device_map);
+  return true;
+}
+
+void BleManager::EmitDeviceList() {
+  if (!dispatcher_) return;
+
+  flutter::EncodableList list;
+  {
+    std::lock_guard<std::mutex> lock(scan_mutex_);
+    for (const auto& d : discovered_devices_) {
+      list.push_back(flutter::EncodableValue(d));
+    }
+  }
+
+  auto value = flutter::EncodableValue(list);
+  dispatcher_->Post([this, value = std::move(value)]() {
+    if (scan_event_sink_) {
+      scan_event_sink_->Success(value);
+    }
+  });
 }
 
 void BleManager::StopScan(
@@ -407,6 +456,7 @@ void BleManager::SupportsWriteWithoutResponse(
 
 void BleManager::Write(
     const std::vector<uint8_t>& data, bool without_response,
+    int max_chunk_size, int chunk_delay_ms, int bytes_per_second,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
   if (tx_characteristic_ == nullptr) {
     result->Error("NOT_CONNECTED", "BLE device not connected");
@@ -417,27 +467,53 @@ void BleManager::Write(
       result.release());
   auto char_copy = tx_characteristic_;
 
-  std::thread([this, data, without_response, shared_result, char_copy]() {
-    try {
-      DataWriter writer;
-      writer.WriteBytes(
-          winrt::array_view<const uint8_t>(data.data(), static_cast<uint32_t>(data.size())));
-      auto buffer = writer.DetachBuffer();
+  const size_t mtu = mtu_payload_ >= 20 ? static_cast<size_t>(mtu_payload_) : 20;
+  const size_t chunk_size = max_chunk_size > 0
+      ? (std::min)(mtu, static_cast<size_t>(max_chunk_size))
+      : mtu;
+  const int delay_floor_ms = (std::max)(0, chunk_delay_ms);
+  const int bps = (std::max)(0, bytes_per_second);
 
+  std::thread([this, data, without_response, shared_result, char_copy, chunk_size,
+               delay_floor_ms, bps]() {
+    try {
       auto write_option = without_response
           ? GattWriteOption::WriteWithoutResponse
           : GattWriteOption::WriteWithResponse;
 
-      auto status = char_copy.WriteValueAsync(buffer, write_option).get();
-      if (status == GattCommunicationStatus::Success) {
-        dispatcher_->Post([shared_result]() {
-          shared_result->Success(flutter::EncodableValue());
-        });
-      } else {
-        dispatcher_->Post([shared_result]() {
-          shared_result->Error("WRITE_FAILED", "GATT write failed");
-        });
+      for (size_t offset = 0; offset < data.size(); offset += chunk_size) {
+        const size_t len = (std::min)(chunk_size, data.size() - offset);
+
+        DataWriter writer;
+        writer.WriteBytes(winrt::array_view<const uint8_t>(
+            data.data() + offset, static_cast<uint32_t>(len)));
+        auto buffer = writer.DetachBuffer();
+
+        auto status = char_copy.WriteValueAsync(buffer, write_option).get();
+        if (status != GattCommunicationStatus::Success) {
+          dispatcher_->Post([shared_result]() {
+            shared_result->Error("WRITE_FAILED", "GATT write failed");
+          });
+          return;
+        }
+
+        if (offset + len < data.size()) {
+          long long throughput_ms = 0;
+          if (bps > 0 && len > 0) {
+            throughput_ms =
+                (static_cast<long long>(len) * 1000 + bps - 1) / bps;
+          }
+          const long long delay_ms =
+              (std::max)(static_cast<long long>(delay_floor_ms), throughput_ms);
+          if (delay_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+          }
+        }
       }
+
+      dispatcher_->Post([shared_result]() {
+        shared_result->Success(flutter::EncodableValue());
+      });
     } catch (const winrt::hresult_error& e) {
       auto msg = winrt::to_string(e.message());
       dispatcher_->Post([shared_result, msg]() {

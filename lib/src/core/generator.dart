@@ -272,15 +272,13 @@ class Generator {
   }
 
   /// Apply [style], emitting all relevant ESC/POS style commands.
+  ///
+  /// Font / size / code-page first, then mode flags (bold, underline, etc.)
+  /// so emphasis is the last state change before text on picky clones.
   List<int> setStyles(PrintTextStyle style, {PrintAlign? align}) {
     List<int> bytes = [];
 
     if (align != null) bytes += _setAlign(align);
-    bytes += style.bold ? cBoldOn.codeUnits : cBoldOff.codeUnits;
-    bytes += style.turn90 ? cTurn90On.codeUnits : cTurn90Off.codeUnits;
-    bytes += style.reverse ? cReverseOn.codeUnits : cReverseOff.codeUnits;
-    bytes +=
-        style.underline ? cUnderline1dot.codeUnits : cUnderlineOff.codeUnits;
 
     final FontType font = style.fontType ?? FontType.fontA;
     bytes += font == FontType.fontB ? cFontB.codeUnits : cFontA.codeUnits;
@@ -299,6 +297,12 @@ class Generator {
           ..add(profile.getCodePageId(style.codeTable)),
       );
     }
+
+    bytes += style.bold ? cBoldOn.codeUnits : cBoldOff.codeUnits;
+    bytes += style.turn90 ? cTurn90On.codeUnits : cTurn90Off.codeUnits;
+    bytes += style.reverse ? cReverseOn.codeUnits : cReverseOff.codeUnits;
+    bytes +=
+        style.underline ? cUnderline1dot.codeUnits : cUnderlineOff.codeUnits;
 
     return bytes;
   }
@@ -422,55 +426,9 @@ class Generator {
   /// [cols] must sum to exactly 12 in total width.
   /// Set [multiLine] to true (default) to automatically wrap overflowing
   /// column content to a subsequent row.
-  // List<int> row(
-  //   List<PrintColumn> cols, {
-  //   bool multiLine = true,
-  //   int columnGap = 1,
-  // }) {
-  //   const totalChars = 32;
-
-  //   final totalFlex = cols.fold<int>(0, (sum, c) => sum + c.flex);
-
-  //   String line = '';
-
-  //   for (int i = 0; i < cols.length; i++) {
-  //     final col = cols[i];
-
-  //     int width = ((col.flex / totalFlex) * totalChars).floor();
-
-  //     // Last column gets remaining chars
-  //     if (i == cols.length - 1) {
-  //       width = totalChars - line.length;
-  //     }
-
-  //     String text = col.text;
-
-  //     if (text.length > width) {
-  //       text = text.substring(0, width);
-  //     }
-
-  //     switch (col.align) {
-  //       case PrintAlign.right:
-  //         text = text.padLeft(width);
-  //         break;
-
-  //       case PrintAlign.center:
-  //         final left = ((width - text.length) / 2).floor();
-  //         final right = width - text.length - left;
-  //         text = '${' ' * left}$text${' ' * right}';
-  //         break;
-
-  //       case PrintAlign.left:
-  //       default:
-  //         text = text.padRight(width);
-  //     }
-
-  //     line += text;
-  //   }
-
-  //   return text(line);
-  // }
-
+  ///
+  /// Per-column styles are applied; bold columns also get a CR overstrike so
+  /// emphasis works when mid-line `ESC E` is ignored (issue #23).
   List<int> row(
     List<PrintColumn> cols, {
     bool multiLine = true,
@@ -739,6 +697,10 @@ class Generator {
   /// When [fromPx] is provided the print head is moved to that pixel position
   /// before the text. When [toPx] is also provided, right/center alignment is
   /// computed within the [fromPx]..[toPx] range.
+  ///
+  /// Positioned bold text is reinforced with a CR overstrike: many clone
+  /// printers ignore mid-line `ESC E` after `ESC $` (issue #23), same class of
+  /// limitation as mid-line `ESC a` (issue #10).
   List<int> _text(
     Uint8List textBytes, {
     PrintTextStyle style = const PrintTextStyle(),
@@ -748,6 +710,7 @@ class Generator {
     int? maxCharsPerLine,
   }) {
     List<int> bytes = [];
+    List<int>? posCmd;
 
     if (fromPx != null) {
       final charWidth = _getCharWidth(style, maxCharsPerLine: maxCharsPerLine);
@@ -766,13 +729,25 @@ class Generator {
       final String hexStr = pos.round().toRadixString(16).padLeft(3, '0');
       final List<int> hexPair = hex.decode(hexStr);
 
-      bytes += Uint8List.fromList(
-        List<int>.from(cPos.codeUnits)..addAll([hexPair[1], hexPair[0]]),
-      );
+      posCmd = List<int>.from(cPos.codeUnits)..addAll([hexPair[1], hexPair[0]]);
+      bytes += posCmd;
     }
 
-    bytes += setStyles(style, align: align);
+    // For positioned text (table columns), horizontal alignment is realised by
+    // the ESC $ absolute position set above — `align` only shifts that position.
+    // Re-issuing ESC a here would be redundant and, mid-line, makes many
+    // generic ESC/POS printers flush the line, breaking rows onto separate
+    // lines (issue #10). So only emit ESC a for full-line text (fromPx == null).
+    bytes += setStyles(style, align: fromPx == null ? align : null);
     bytes += textBytes;
+
+    // Reinforce mid-line bold via CR overstrike (issue #23).
+    if (posCmd != null && style.bold && textBytes.isNotEmpty) {
+      bytes += cCr.codeUnits;
+      bytes += posCmd;
+      bytes += textBytes;
+    }
+
     return bytes;
   }
 }

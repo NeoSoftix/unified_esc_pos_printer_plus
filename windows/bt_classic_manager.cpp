@@ -1,5 +1,7 @@
 #include "bt_classic_manager.h"
 
+#include <algorithm>
+#include <chrono>
 #include <iomanip>
 #include <sstream>
 #include <thread>
@@ -307,7 +309,7 @@ void BtClassicManager::Connect(
 // ── Writing ──────────────────────────────────────────────────────────────
 
 void BtClassicManager::Write(
-    const std::vector<uint8_t>& data,
+    const std::vector<uint8_t>& data, int chunk_size, int chunk_delay_ms,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
   if (writer_ == nullptr) {
     result->Error("NOT_CONNECTED", "Bluetooth Classic device not connected");
@@ -319,13 +321,28 @@ void BtClassicManager::Write(
           result.release());
   auto writer_copy = writer_;
 
-  std::thread([this, data, shared_result, writer_copy]() {
+  std::thread([this, data, chunk_size, chunk_delay_ms, shared_result,
+               writer_copy]() {
     try {
-      writer_copy.WriteBytes(
-          winrt::array_view<const uint8_t>(
-              data.data(), static_cast<uint32_t>(data.size())));
-      writer_copy.StoreAsync().get();
-      writer_copy.FlushAsync().get();
+      // Pace the transfer: cheap printer modules forward data to the print
+      // MCU over an internal UART without flow control, and a large job at
+      // full RFCOMM speed overflows it.
+      const size_t step =
+          chunk_size > 0 ? static_cast<size_t>(chunk_size) : data.size();
+
+      for (size_t offset = 0; offset < data.size(); offset += step) {
+        const size_t len = (std::min)(step, data.size() - offset);
+
+        writer_copy.WriteBytes(winrt::array_view<const uint8_t>(
+            data.data() + offset, static_cast<uint32_t>(len)));
+        writer_copy.StoreAsync().get();
+        writer_copy.FlushAsync().get();
+
+        if (chunk_delay_ms > 0 && offset + len < data.size()) {
+          std::this_thread::sleep_for(
+              std::chrono::milliseconds(chunk_delay_ms));
+        }
+      }
 
       dispatcher_->Post([shared_result]() {
         shared_result->Success(flutter::EncodableValue());

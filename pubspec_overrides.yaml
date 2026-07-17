@@ -1,0 +1,7 @@
+# Local development only; this file is not published to pub.dev.
+# libserialport_plus 1.0.x builds its native library via Dart build hooks,
+# which currently fails on Windows when the project path contains spaces
+# (unquoted MSVC invocation). Pin 0.1.x locally so flutter test/build work.
+# Remove once the upstream build hook is fixed.
+dependency_overrides:
+  libserialport_plus: 0.1.2

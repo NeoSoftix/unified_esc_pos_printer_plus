@@ -52,6 +52,20 @@ class PrinterManager {
   final StreamController<PrinterConnectionState> _stateController =
       StreamController<PrinterConnectionState>.broadcast();
 
+  Future<void> _opQueue = Future<void>.value();
+
+  /// Runs [action] after all previously queued operations complete.
+  ///
+  /// Serializes connect/print/disconnect so concurrent callers cannot
+  /// interrupt a print job in progress (issue #21): a `connect()` issued
+  /// while another job is printing waits for that job instead of tearing
+  /// down its connection.
+  Future<T> _enqueue<T>(Future<T> Function() action) {
+    final Future<T> run = _opQueue.then((_) => action());
+    _opQueue = run.then<void>((_) {}, onError: (_) {});
+    return run;
+  }
+
   /// Scan for all printer types simultaneously, returning a merged stream.
   ///
   /// Each emission is the latest accumulated list for each connector type;
@@ -155,28 +169,49 @@ class PrinterManager {
 
   /// Connect to [device].
   ///
-  /// If already connected to another device, disconnects first.
+  /// Connecting to the device that is already connected is a no-op.
+  /// If connected to a different device, disconnects from it first.
+  ///
+  /// Operations are serialized: a `connect()` issued while another job is
+  /// printing on this manager waits for that job to finish instead of
+  /// interrupting it (issue #21).
   Future<void> connect(
     PrinterDevice device, {
     Duration timeout = const Duration(seconds: 10),
-  }) async {
-    if (_active != null) await disconnect();
+  }) {
+    return _enqueue(() async {
+      if (_active != null &&
+          isConnected &&
+          _activeDevice != null &&
+          _isSameDevice(_activeDevice!, device)) {
+        return;
+      }
 
-    final PrinterConnector<PrinterDevice> connector = _connectorFor(device);
+      if (_active != null) await _disconnectInternal();
 
-    _active = connector;
-    _activeDevice = device;
+      final PrinterConnector<PrinterDevice> connector = _connectorFor(device);
 
-    // Forward state changes from the active connector.
-    _activeStateSub = connector.stateStream.listen((s) {
-      if (!_stateController.isClosed) _stateController.add(s);
+      _active = connector;
+      _activeDevice = device;
+
+      // Forward state changes from the active connector.
+      _activeStateSub = connector.stateStream.listen((s) {
+        if (!_stateController.isClosed) _stateController.add(s);
+      });
+
+      await connector.connect(device, timeout: timeout);
     });
-
-    await connector.connect(device, timeout: timeout);
   }
 
-  /// Disconnect from the currently connected printer.
-  Future<void> disconnect() async {
+  /// Disconnect from the currently connected printer, draining buffered
+  /// write data first so a job printed just before is not truncated.
+  ///
+  /// Waits for queued operations (e.g. a print in progress) to finish first.
+  Future<void> disconnect() {
+    return _enqueue(_disconnectInternal);
+  }
+
+  Future<void> _disconnectInternal() async {
     await _activeStateSub?.cancel();
     _activeStateSub = null;
 
@@ -190,26 +225,42 @@ class PrinterManager {
   }
 
   /// Send the bytes from [ticket] to the connected printer.
-  Future<void> printTicket(Ticket ticket) async {
-    _assertConnected('printTicket');
-    await _active!.writeBytes(ticket.bytes);
+  Future<void> printTicket(Ticket ticket) {
+    return _enqueue(() async {
+      _assertConnected('printTicket');
+      await _active!.writeBytes(ticket.bytes);
+    });
   }
 
   /// Send raw [bytes] to the connected printer.
-  Future<void> printBytes(List<int> bytes) async {
-    _assertConnected('printBytes');
-    await _active!.writeBytes(bytes);
+  Future<void> printBytes(List<int> bytes) {
+    return _enqueue(() async {
+      _assertConnected('printBytes');
+      await _active!.writeBytes(bytes);
+    });
+  }
+
+  /// Wait until data from previous print calls has finished transmitting.
+  ///
+  /// [disconnect] performs this wait internally; call it directly when you
+  /// need the barrier without disconnecting.
+  Future<void> waitWriteComplete() {
+    return _enqueue(() async {
+      await _active?.waitWriteComplete();
+    });
   }
 
   /// Open the cash drawer connected to [pin] (default: pin 2).
-  Future<void> openCashDrawer({CashDrawer pin = CashDrawer.pin2}) async {
-    _assertConnected('openCashDrawer');
+  Future<void> openCashDrawer({CashDrawer pin = CashDrawer.pin2}) {
+    return _enqueue(() async {
+      _assertConnected('openCashDrawer');
 
-    final List<int> bytes = pin == CashDrawer.pin2
-        ? cCashDrawerPin2.codeUnits
-        : cCashDrawerPin5.codeUnits;
+      final List<int> bytes = pin == CashDrawer.pin2
+          ? cCashDrawerPin2.codeUnits
+          : cCashDrawerPin5.codeUnits;
 
-    await _active!.writeBytes(bytes);
+      await _active!.writeBytes(bytes);
+    });
   }
 
   /// Current connection state of the active connector.
@@ -227,16 +278,32 @@ class PrinterManager {
   PrinterDevice? get connectedDevice => _activeDevice;
 
   /// Disconnect and release all connector resources.
-  Future<void> dispose() async {
-    await disconnect();
-    await _stateController.close();
-    await _network.dispose();
-    await _ble.dispose();
-    await _bluetooth.dispose();
-    await _usb.dispose();
+  ///
+  /// Waits for queued operations (e.g. a print in progress) to finish first.
+  Future<void> dispose() {
+    return _enqueue(() async {
+      await _disconnectInternal();
+      await _stateController.close();
+      await _network.dispose();
+      await _ble.dispose();
+      await _bluetooth.dispose();
+      await _usb.dispose();
+    });
   }
 
   // Helpers
+  bool _isSameDevice(PrinterDevice a, PrinterDevice b) {
+    return switch ((a, b)) {
+      (NetworkPrinterDevice x, NetworkPrinterDevice y) =>
+        x.host == y.host && x.port == y.port,
+      (BlePrinterDevice x, BlePrinterDevice y) => x.deviceId == y.deviceId,
+      (BluetoothPrinterDevice x, BluetoothPrinterDevice y) =>
+        x.address == y.address,
+      (UsbPrinterDevice x, UsbPrinterDevice y) => x.identifier == y.identifier,
+      _ => false,
+    };
+  }
+
   PrinterConnector<PrinterDevice> _connectorFor(PrinterDevice device) {
     return switch (device) {
       NetworkPrinterDevice() => _network as PrinterConnector<PrinterDevice>,

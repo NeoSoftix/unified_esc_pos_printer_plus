@@ -53,4 +53,51 @@ void main() {
     ]);
     expect(countAlignCmds(bytes), 1);
   });
+
+  test('bold column emits ESC E on and CR overstrike (issue #23)', () {
+    final bytes = gen.row([
+      PrintColumn(text: 'Label', flex: 7),
+      PrintColumn(
+        text: 'BOLD',
+        flex: 3,
+        align: PrintAlign.right,
+        style: const PrintTextStyle(bold: true),
+      ),
+    ]);
+
+    // ESC E \x01 must appear for the bold column.
+    var boldOnCount = 0;
+    for (var i = 0; i < bytes.length - 2; i++) {
+      if (bytes[i] == 0x1B && bytes[i + 1] == 0x45 && bytes[i + 2] == 0x01) {
+        boldOnCount++;
+      }
+    }
+    expect(boldOnCount, greaterThanOrEqualTo(1),
+        reason: 'row() must emit ESC E 1 for bold PrintColumn.style');
+
+    // CR overstrike reinforces mid-line bold on clone printers.
+    expect(bytes.contains(0x0D), isTrue,
+        reason: 'bold positioned text must emit CR for overstrike');
+
+    // Still a single-line row: one ESC a, one LF at the end.
+    expect(countAlignCmds(bytes), 1);
+    expect(bytes.where((b) => b == 0x0A).length, 1);
+    expect(firstLf(bytes), bytes.length - 1);
+
+    // "BOLD" appears twice (print + overstrike).
+    final boldAscii = 'BOLD'.codeUnits;
+    var occurrences = 0;
+    for (var i = 0; i <= bytes.length - boldAscii.length; i++) {
+      var match = true;
+      for (var j = 0; j < boldAscii.length; j++) {
+        if (bytes[i + j] != boldAscii[j]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) occurrences++;
+    }
+    expect(occurrences, 2,
+        reason: 'bold column text must be printed twice for overstrike');
+  });
 }

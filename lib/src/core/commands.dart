@@ -75,6 +75,9 @@ const String cAlignRight = '${esc}a2';
 /// Set absolute print position [nL] [nH]
 const String cPos = '$esc\$';
 
+/// Carriage return (return print head to start of line without feeding)
+const String cCr = '\x0D';
+
 /// Print and feed n lines [N]
 const String cFeedN = '${esc}d';
 
@@ -137,3 +140,30 @@ const int kScanSubnetTimeoutMs = 500;
 
 /// Default chunk size for Bluetooth Classic writes (bytes)
 const int kDefaultBtChunkSize = 512;
+
+/// Default pause between Bluetooth Classic write chunks (milliseconds).
+/// Paces the transfer so cheap printer modules, which forward data to the
+/// print MCU over an internal UART without flow control, are not overflowed
+/// by large jobs.
+const int kDefaultBtChunkDelayMs = 5;
+
+/// Conservative Bluetooth Classic (SPP) throughput for drain estimation (bytes/second)
+const int kBtDrainBytesPerSecond = 8 * 1024;
+
+/// Assumed size of the local OS/stack write buffer (bytes)
+const int kDrainBufferBytes = 16 * 1024;
+
+/// Upper bound on any single drain wait (milliseconds)
+const int kMaxDrainWaitMs = 10000;
+
+/// Drain delay after BLE write-without-response data (milliseconds)
+const int kBleWwrDrainDelayMs = 500;
+
+/// Default BLE write chunk size (bytes). `0` = negotiated MTU.
+const int kDefaultBleChunkSize = 128;
+
+/// Default BLE write throughput for pacing (bytes/second).
+const int kDefaultBleBytesPerSecond = 6 * 1024;
+
+/// Minimum pause between BLE write chunks (milliseconds).
+const int kDefaultBleChunkDelayMs = 0;

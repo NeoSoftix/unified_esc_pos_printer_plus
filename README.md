@@ -25,14 +25,20 @@ A unified ESC/POS thermal printer package for Flutter. Supports USB, Bluetooth C
 
 ## Platform Support
 
-| Connection        | Android   | iOS | Windows             | Linux        | macOS        |
-| ----------------- | --------- | --- | ------------------- | ------------ | ------------ |
-| Network (TCP/IP)  | Yes       | Yes | Yes                 | Yes          | Yes          |
-| Bluetooth Classic | Yes       | —   | Yes                 | —            | —            |
-| BLE               | Yes       | Yes | Yes                 | —            | —            |
-| USB               | Yes (OTG) | —   | Yes (Print Spooler) | Yes (serial) | Yes (serial) |
+| Connection        | Android   | iOS | Windows             | Linux        | macOS        | Web |
+| ----------------- | --------- | --- | ------------------- | ------------ | ------------ | --- |
+| Network (TCP/IP)  | Yes       | Yes | Yes                 | Yes          | Yes          | No  |
+| Bluetooth Classic | Yes       | No  | Yes                 | No           | No           | No  |
+| BLE               | Yes       | Yes | Yes                 | No           | No           | No  |
+| USB               | Yes (OTG) | No  | Yes (Print Spooler) | Yes (serial) | Yes (serial) | No  |
+
+> **Web:** the package compiles on web so multi-platform apps can share code,
+> but browsers expose no raw TCP, SPP, or USB access, so no connection type
+> is functional there. `scanPrinters()` finds no devices and `connect()`
+> throws `PrinterConnectionException`.
 
 > **Android USB notes:**
+>
 > - The Android device must support **USB OTG** (host mode). Most modern phones and tablets do.
 > - The connector picks the right transport automatically based on the printer's USB interface class:
 >   - **CDC / Virtual COM** chips (FTDI, CP210x, PL2303, CH34x, USB CDC ACM) go through the `usb_serial` package.
@@ -92,9 +98,11 @@ Add only the permissions for the connection types you use:
 <uses-feature android:name="android.hardware.usb.host" android:required="false" />
 ```
 
-> **Note on `neverForLocation`:** the `BLUETOOTH_SCAN` declaration above uses `usesPermissionFlags="neverForLocation"` to tell Android that your app does not derive physical location from BLE scan results. Remove this flag if your app *does* use BLE scans to infer location — in that case you must also request `ACCESS_FINE_LOCATION` at runtime on API 31+.
+> **Note on `neverForLocation`:** the `BLUETOOTH_SCAN` declaration above uses `usesPermissionFlags="neverForLocation"` to tell Android that your app does not derive physical location from BLE scan results. Remove this flag if your app _does_ use BLE scans to infer location — in that case you must also request `ACCESS_FINE_LOCATION` at runtime on API 31+.
 
 ### iOS Setup
+
+This plugin supports both **CocoaPods** and **Swift Package Manager**. No setup is needed for either: Flutter 3.44+ uses SPM by default, and older versions fall back to CocoaPods automatically. To opt in to SPM on an earlier Flutter version, run `flutter config --enable-swift-package-manager`.
 
 Add to `ios/Runner/Info.plist`:
 
@@ -173,7 +181,7 @@ ticket.text('Café coûté 12,50 €', style: const PrintTextStyle(codeTable: 'C
 
 ### Table Layouts
 
-Use `row()` with `PrintColumn` for multi-column layouts. Columns use flex-based proportional sizing:
+Use `row()` with `PrintColumn` for multi-column layouts. Columns use flex-based proportional sizing and support per-column `PrintTextStyle`:
 
 ```dart
 // 2-column receipt layout
@@ -183,6 +191,7 @@ ticket.row([
     text: '\$3.50',
     flex: 1,
     align: PrintAlign.right,
+    style: const PrintTextStyle(bold: true),
   ),
 ]);
 
@@ -409,7 +418,93 @@ if (manager.isConnected) { ... }
 final device = manager.connectedDevice;
 ```
 
-### Error Handling
+### Waiting for Writes to Complete
+
+On some transports (Bluetooth Classic, BLE write-without-response, USB
+serial), `printTicket()` resolves once the data is accepted by an OS buffer,
+not when it has physically reached the printer. `disconnect()` automatically
+waits for that buffer to drain, so printing followed immediately by a
+disconnect does not truncate the job:
+
+```dart
+await manager.printTicket(ticket);
+await manager.disconnect(); // waits for buffered data to drain first
+```
+
+When you need the barrier without disconnecting (e.g. printing several
+tickets and reporting completion between them), use `waitWriteComplete()`:
+
+```dart
+await manager.printTicket(ticket);
+await manager.waitWriteComplete(); // resolves when the data has had time to reach the printer
+```
+
+The drain time is estimated from the amount of data written and a
+conservative link throughput. For Bluetooth Classic you can tune it via the
+connector:
+
+```dart
+final manager = PrinterManager(
+  bluetoothConnector: BluetoothConnector(
+    drainBytesPerSecond: 16 * 1024,              // your printer's real throughput
+    maxDrainWait: const Duration(seconds: 5),     // cap on any single wait
+  ),
+);
+```
+
+### BLE Write Pacing
+
+BLE printers often forward data to the print MCU over a small internal UART
+**without flow control**. A GATT write ACK only means the radio accepted the
+packet — not that the printer has drained it. Pushing a large ticket too fast
+(especially multilingual `textRaster` bitmaps) overflows that buffer and
+shows up as garbled / weird characters. Classic Bluetooth is usually less
+sensitive because RFCOMM buffers better.
+
+`BleConnector` paces writes by default:
+
+| Parameter        | Default    | Meaning                                          |
+| ---------------- | ---------- | ------------------------------------------------ |
+| `chunkSize`      | `128`      | Bytes per GATT write (`0` = full negotiated MTU) |
+| `bytesPerSecond` | `6 * 1024` | Target throughput used to delay between chunks   |
+
+These defaults are a practical middle ground for common cheap ESC/POS BLE
+modules. They are **not guaranteed for every printer** — models differ. If
+output still garbles (often only on large / full tickets), slow the transfer:
+
+```dart
+final manager = PrinterManager(
+  bleConnector: BleConnector(
+    chunkSize: 64,
+    bytesPerSecond: 4 * 1024, // lower = safer, slower
+  ),
+);
+```
+
+If a printer handles faster transfers cleanly, you can raise
+`bytesPerSecond` (e.g. `8 * 1024`). Tune per device: increase until output
+garbles, then step back.
+
+### Concurrent Print Jobs
+
+Print jobs cannot interrupt each other:
+
+- **Within one isolate**, `PrinterManager` serializes its operations. A
+  `connect()` or `disconnect()` issued while another job is printing waits
+  for that job to finish, and `connect()` to the already-connected device is
+  a no-op. Calling `printTicket()` from multiple places without external
+  locking is safe; the jobs print one after the other.
+- **Across isolates on Android** (e.g. printing from a background
+  notification handler while the main app prints too), the Bluetooth
+  Classic, BLE, and USB printer-class connections are shared process-wide.
+  A second isolate connecting to the same printer reuses the live connection
+  and its job queues behind the one in progress. Connecting to a _different_
+  printer while another isolate holds the connection throws a
+  `PrinterConnectionException` with a printer-busy message; retry after the
+  other job finishes.
+
+Each print job is delivered to the platform as a single atomic write, so
+even jobs from separate isolates cannot interleave their bytes.
 
 The package provides a typed exception hierarchy:
 

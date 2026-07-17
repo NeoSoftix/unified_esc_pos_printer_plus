@@ -86,11 +86,20 @@ void main() {
       expect(ticket.bytes, isNotEmpty);
     });
 
-    test('cut appends bytes after feed', () {
+    test('cut appends the cut command', () {
       ticket.clear();
       ticket.cut();
-      // cut() prepends 5 empty lines then the cut command
-      expect(ticket.bytes.length, greaterThan(5));
+      expect(ticket.bytes, isNotEmpty);
+    });
+
+    test('cut with linesBefore prepends feed lines', () {
+      ticket.clear();
+      ticket.cut();
+      final int cutOnly = ticket.bytes.length;
+
+      ticket.clear();
+      ticket.cut(linesBefore: 5);
+      expect(ticket.bytes.length, greaterThan(cutOnly));
     });
   });
 }
