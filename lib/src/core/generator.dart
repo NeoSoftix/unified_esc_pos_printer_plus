@@ -436,9 +436,9 @@ class Generator {
   }) {
     // Use paperSize-specific chars per line
     final int totalChars = switch (paperSize) {
-      PaperSize.mm58 => 37, // 58mm = 32 chars
-      PaperSize.mm72 => 41, // 72mm = 36 chars
-      PaperSize.mm80 => 45, // 80mm = 39 chars (some printers support 42)
+      PaperSize.mm58 => 37,
+      PaperSize.mm72 => 41,
+      PaperSize.mm80 => 45,
     };
 
     final int totalFlex = cols.fold(0, (sum, c) => sum + c.flex);
@@ -447,6 +447,9 @@ class Generator {
     String fullLine = '';
     bool isNextRow = false;
     final List<PrintColumn> nextRow = [];
+
+    // If any column is bold, print the whole row bold
+    final bool rowBold = cols.any((c) => c.style.bold);
 
     for (int i = 0; i < cols.length; i++) {
       final col = cols[i];
@@ -461,12 +464,14 @@ class Generator {
           col.textEncoded != null ? col.textEncoded! : _encode(col.text);
 
       if (multiLine && encoded.length > width) {
-        nextRow.add(PrintColumn(
-          textEncoded: encoded.sublist(width),
-          flex: col.flex,
-          align: col.align,
-          style: col.style,
-        ));
+        nextRow.add(
+          PrintColumn(
+            textEncoded: encoded.sublist(width),
+            flex: col.flex,
+            align: col.align,
+            style: col.style,
+          ),
+        );
         encoded = encoded.sublist(0, width);
         isNextRow = true;
       }
@@ -486,15 +491,30 @@ class Generator {
       }
 
       fullLine += textStr;
-      if (i < cols.length - 1) fullLine += ' '; // columnGap
+
+      if (i < cols.length - 1) {
+        fullLine += ' ' * columnGap;
+      }
     }
 
-    // Print entire line as ONE text with left alignment
-    bytes += text(fullLine, align: PrintAlign.left);
-    bytes = bytes.sublist(0, bytes.length - 1); // Remove extra newline
+    // Print entire line with row style
+    bytes += text(
+      fullLine,
+      align: PrintAlign.left,
+      style: PrintTextStyle(
+        bold: rowBold,
+      ),
+    );
+
+    // Remove extra newline added by text()
+    bytes = bytes.sublist(0, bytes.length - 1);
+
+    // Add exactly one newline
     bytes += emptyLines(1);
 
-    if (isNextRow) bytes += row(nextRow, columnGap: columnGap);
+    if (isNextRow) {
+      bytes += row(nextRow, columnGap: columnGap);
+    }
 
     return bytes;
   }
